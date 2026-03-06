@@ -1,0 +1,11 @@
+profileVersion = "v1"
+
+[[supports]]
+game = "eldenring"
+
+[[natives]]
+path = "natives/elden-ring-shared-damage.dll"
+
+[[natives]]
+path = "natives/SeamlessCoop/ersc.dll"
+optional = true

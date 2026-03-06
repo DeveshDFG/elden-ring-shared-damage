@@ -1,7 +1,9 @@
 # Environment & secrets
+.claude
 .env
 .env.*
 *.env
+CLAUDE.md
 secrets.*
 
 # Build output

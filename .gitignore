@@ -1,0 +1,56 @@
+# Environment & secrets
+.env
+.env.*
+*.env
+secrets.*
+
+# Build output
+build/
+out/
+bin/
+obj/
+x64/
+x86/
+Debug/
+Release/
+*.dll
+*.pdb
+*.lib
+*.exp
+*.ilk
+*.map
+
+# Dll output
+natives/
+SeamlessCoop/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.VC.opendb
+ipch/
+*.ncb
+*.opendb
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Compiled object files
+*.o
+*.obj
+
+# Logs & crash dumps
+*.log
+*.dmp
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini

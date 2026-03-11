@@ -1,3 +1,4 @@
+#define NOMINMAX
 #include "hooks.h"
 #include "damage.h"
 #include <fstream>
@@ -5,6 +6,12 @@
 #include <MinHook.h>
 #include <cstdint>
 #include <psapi.h>
+#include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <set>
+#include <vector>
+#include <steam/steam_api.h>
 
 // WorldChrManImp pointer patterns — RIP-relative MOV, double-dereference.
 // Scan returns address of the instruction; the 4-byte RIP offset sits at +3,
@@ -44,8 +51,7 @@ static const char* DAMAGE_FUNC_PROLOGUE =
 // Dereference at hook time to get the live instance pointer.
 uintptr_t* g_worldChrManPtr = nullptr;
 
-typedef void(__fastcall* DamageFunc_t)(uintptr_t rcx, int rdx);
-static DamageFunc_t fpDamageFunc = nullptr;
+DamageFunc_t fpDamageFunc = nullptr;
 
 // Returns true if the 3 bytes at `addr` look like a common x64 MSVC function prologue.
 static bool LooksLikeProlog(uintptr_t addr)
@@ -236,14 +242,33 @@ static int32_t ReadLocalPlayerHp()
     return *reinterpret_cast<int32_t*>(statModule + 0x138);
 }
 
+// Thread ID of the thread that first invoked hkDamageFunc. MinHook calls our
+// detour on the same thread the game used, so this is the authoritative
+// game-thread ID. Written once; read by hkRunCallbacks for validation.
+static std::atomic<DWORD> g_gameThreadId{0};
+
+static void DrainRemoteDamage(); // defined after ApplyDamageToLocalPlayer
+
 void __fastcall hkDamageFunc(uintptr_t rcx, int rdx)
 {
+    // Record the game thread ID on first invocation — MinHook calls us on the
+    // same thread the game used, so this is more reliable than DllMain's TID.
+    {
+        DWORD expected = 0;
+        g_gameThreadId.compare_exchange_strong(expected, GetCurrentThreadId(),
+                                               std::memory_order_relaxed);
+    }
+
     // Fast path: WorldChrManImp not ready yet.
     if (!g_worldChrManPtr || !*g_worldChrManPtr)
     {
         fpDamageFunc(rcx, rdx);
         return;
     }
+
+    // Drain any damage queued by the poll thread — applied here on the game
+    // thread so fpDamageFunc is never called from a background thread.
+    DrainRemoteDamage();
 
     // rcx is the ChrStatModule* the game is writing new HP into.
     // Only act if it matches the local player's statModule.
@@ -263,7 +288,7 @@ void __fastcall hkDamageFunc(uintptr_t rcx, int rdx)
         const int32_t damage = currentHp - newHp;
         ModUtils::Log("SharedDamage: Hook fired: damage=%d (hp %d -> %d)", damage, currentHp, newHp);
         fpDamageFunc(rcx, rdx);
-        PropagateDamage(damage);
+        BroadcastDamage(damage);
     }
     else
     {
@@ -433,6 +458,93 @@ static uintptr_t WaitForWorldChrMan()
     return ptrAddr;
 }
 
+// --- Remote damage queue ---
+// EnqueueRemoteDamage is called from the poll thread (ModThread).
+// DrainRemoteDamage is called from two game-thread hooks:
+//   1. hkDamageFunc — fires on any local HP write (fast path)
+//   2. hkRunCallbacks — fires every time ersc/game calls SteamAPI_RunCallbacks
+//      (reliable fallback that fires even when the local player is idle)
+// Both drain points ensure fpDamageFunc is never called from ModThread.
+
+static std::mutex           g_damageMutex;
+static std::vector<int32_t> g_damagePending;
+
+void EnqueueRemoteDamage(int32_t damage)
+{
+    std::lock_guard<std::mutex> lk(g_damageMutex);
+    g_damagePending.push_back(damage);
+}
+
+static void DrainRemoteDamage()
+{
+    std::vector<int32_t> pending;
+    {
+        std::lock_guard<std::mutex> lk(g_damageMutex);
+        pending.swap(g_damagePending);
+    }
+    for (const int32_t d : pending)
+        ApplyDamageToLocalPlayer(d);
+}
+
+// Second drain point: hook SteamAPI_RunCallbacks so DrainRemoteDamage fires
+// on the game/ersc thread every callback cycle, not just on HP-write events.
+typedef void (*RunCallbacks_t)();
+static RunCallbacks_t fpRunCallbacks = nullptr;
+
+static void hkRunCallbacks()
+{
+    fpRunCallbacks();
+
+    // Log each unique calling thread ID once. A set ensures no caller is
+    // missed regardless of interleaving. Compare against g_gameThreadId
+    // (captured from hkDamageFunc) — that's the authoritative game thread.
+    {
+        static std::mutex  s_seenMutex;
+        static std::set<DWORD> s_seenThreads;
+        const DWORD tid      = GetCurrentThreadId();
+        const DWORD gameTid  = g_gameThreadId.load(std::memory_order_relaxed);
+        bool isNew = false;
+        {
+            std::lock_guard<std::mutex> lk(s_seenMutex);
+            isNew = s_seenThreads.insert(tid).second;
+        }
+        if (isNew)
+        {
+            char dbg[160];
+            sprintf_s(dbg,
+                      "[SharedDamage] hkRunCallbacks: tid=%lu gameTid=%lu isGameThread=%d\n",
+                      tid, gameTid, (gameTid && tid == gameTid) ? 1 : 0);
+            OutputDebugStringA(dbg);
+            ModUtils::Log("SharedDamage: hkRunCallbacks: tid=%lu gameTid=%lu isGameThread=%d",
+                          tid, gameTid, (gameTid && tid == gameTid) ? 1 : 0);
+        }
+    }
+
+    DrainRemoteDamage();
+}
+
+// Apply a received damage amount to the local player via the hooked write path.
+void ApplyDamageToLocalPlayer(int32_t damage)
+{
+    const uintptr_t statModule = GetLocalPlayerStatModule();
+    if (!statModule)
+    {
+        OutputDebugStringA("[SharedDamage] ApplyDamageToLocalPlayer: statModule null — skipping\n");
+        ModUtils::Log("SharedDamage: ApplyDamageToLocalPlayer: statModule null — skipping");
+        return;
+    }
+    const int32_t currentHp = *reinterpret_cast<int32_t*>(statModule + 0x138);
+    const int32_t newHp     = std::max(0, currentHp - damage);
+    char dbg[128];
+    sprintf_s(dbg, "[SharedDamage] ApplyDamageToLocalPlayer: damage=%d hp=%d -> %d\n",
+              damage, currentHp, newHp);
+    OutputDebugStringA(dbg);
+    ModUtils::Log("SharedDamage: ApplyDamageToLocalPlayer: damage=%d hp=%d -> %d",
+                  damage, currentHp, newHp);
+    fpDamageFunc(statModule, newHp);
+}
+
+
 void InitHooks()
 {
     OutputDebugStringA("[SharedDamage] InitHooks entered\n");
@@ -589,8 +701,10 @@ void InitHooks()
         return;
     }
 
-    // --- Install hook at the validated function entry ---
+    // --- Install hooks ---
     MH_Initialize();
+
+    // Hook 1: game's HP-write function — primary drain point for remote damage.
     const MH_STATUS status = MH_CreateHook(
         reinterpret_cast<void*>(funcStart),
         reinterpret_cast<void*>(&hkDamageFunc),
@@ -598,11 +712,32 @@ void InitHooks()
     );
     if (status != MH_OK)
     {
-        ModUtils::Log("SharedDamage: MH_CreateHook failed (status %d).", (int)status);
+        ModUtils::Log("SharedDamage: MH_CreateHook (damage) failed (status %d).", (int)status);
         return;
     }
+    ModUtils::Log("SharedDamage: Damage hook installed at %p.", (void*)funcStart);
+
+    // Hook 2: SteamAPI_RunCallbacks — reliable game-thread tick for draining
+    // remote damage when the local player is idle and hkDamageFunc never fires.
+    // ersc calls this from the game thread on every frame; our hook piggybacks.
+    const MH_STATUS cbStatus = MH_CreateHookApi(
+        L"steam_api64", "SteamAPI_RunCallbacks",
+        reinterpret_cast<void*>(&hkRunCallbacks),
+        reinterpret_cast<void**>(&fpRunCallbacks)
+    );
+    if (cbStatus != MH_OK)
+    {
+        ModUtils::Log("SharedDamage: MH_CreateHookApi (RunCallbacks) failed (status %d) — remote damage will drain on HP-write only.", (int)cbStatus);
+    }
+    else
+    {
+        ModUtils::Log("SharedDamage: SteamAPI_RunCallbacks hook installed.");
+    }
+
     MH_EnableHook(MH_ALL_HOOKS);
-    ModUtils::Log("SharedDamage: Hook installed at function entry %p.", (void*)funcStart);
+
+    OutputDebugStringA("[SharedDamage] InitHooks returning\n");
+    ModUtils::Log("SharedDamage: InitHooks returning");
 }
 
 void ShutdownHooks()

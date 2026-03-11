@@ -54,3 +54,8 @@ Makefile
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# other
+.smithbox
+regulation.bin
+regulation.bin.prev

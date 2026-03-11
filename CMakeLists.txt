@@ -47,6 +47,24 @@ target_link_libraries(elden-ring-shared-damage PRIVATE
     psapi
 )
 
+# Steam SDK — point STEAM_SDK_PATH at the root of the Steamworks SDK
+# (the directory that contains public/ and redistributable_bin/).
+# The game ships steam_api64.dll; we only need headers + the import lib.
+# Example: cmake -B build -A x64 -DSTEAM_SDK_PATH=C:/steamworks_sdk_158
+set(STEAM_SDK_PATH "C:/Steam/steamworks_sdk/sdk" CACHE PATH "Path to the Steamworks SDK root directory")
+if(STEAM_SDK_PATH)
+    target_include_directories(elden-ring-shared-damage PRIVATE
+        "${STEAM_SDK_PATH}/public"
+    )
+    target_link_libraries(elden-ring-shared-damage PRIVATE
+        "${STEAM_SDK_PATH}/redistributable_bin/win64/steam_api64.lib"
+    )
+else()
+    message(WARNING
+        "STEAM_SDK_PATH not set — Steam P2P networking will not compile. "
+        "Pass -DSTEAM_SDK_PATH=<path> to cmake or set it in CMakeCache.txt.")
+endif()
+
 # Output the DLL directly into natives/ so me3 can pick it up immediately
 set_target_properties(elden-ring-shared-damage PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY                "${CMAKE_SOURCE_DIR}/natives"

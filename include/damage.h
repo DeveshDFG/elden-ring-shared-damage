@@ -16,6 +16,10 @@ struct DamagePacket
 };
 #pragma pack(pop)
 
+// SpEffect ID applied to each player that receives mirrored damage.
+// Defined in the mod's regulation.bin.
+static constexpr int32_t SHARED_ON_HIT_SPEFFECT_ID = 21950012;
+
 // Broadcast a damage event to all connected peers via Steam P2P.
 // Called by hkDamageFunc after the local HP write is confirmed.
 void BroadcastDamage(int32_t damage);

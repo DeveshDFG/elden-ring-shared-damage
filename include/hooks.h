@@ -16,6 +16,10 @@ extern DamageFunc_t fpDamageFunc;
 // Must be called from the game thread (i.e. from within DrainRemoteDamage).
 void ApplyDamageToLocalPlayer(int32_t damage);
 
+// Apply the shared on-hit SpEffect to the local player.
+// Must be called on the same game thread as ApplyDamageToLocalPlayer.
+void ApplySharedHitSpEffectToLocalPlayer();
+
 // Queue damage received from a remote peer for application on the game thread.
 // Safe to call from any thread; drained inside hkDamageFunc.
 void EnqueueRemoteDamage(int32_t damage);

@@ -47,11 +47,46 @@ static const char* DAMAGE_PATTERN_EARLY =
 static const char* DAMAGE_FUNC_PROLOGUE =
     "48 89 5c 24 18 48 89 6c 24 20 89 54 24 10 56 57 41 56 48 83 ec 30";
 
+// Generic HP-delta wrapper that computes new HP from a signed delta before
+// forwarding into the final HP-write function. The match sits 0x42 bytes into
+// the wrapper on 1.16.1; subtract that amount to reach the true function entry.
+// Local binary analysis shows this path has multiple callers and is exercised
+// before lethal writes are clamped/sentinelized.
+static const char* HP_DELTA_WRAPPER_PATTERN =
+    "03 9f 38 01 00 00 85 db 7f ? 48 8b cf e8 ? ? ? ? 84 c0 74 ? "
+    "bb 01 00 00 00 0f b6 44 24 70 44 0f b6 c6 f3 0f 10 44 24 68 "
+    "8b d3 f3 0f 10 5c 24 60 48 8b cf";
+static constexpr uintptr_t HP_DELTA_WRAPPER_BACKTRACK = 0x42;
+
+// AddSpEffect mid-function pattern — matches a sequence inside the function body.
+// The function entry is exactly 0x1D (29) bytes before the match.
+// Source: The Grand Archives Elden Ring CT-TGA, SpEffect_code.cea
+// Calling convention (x64 fastcall):
+//   rcx = ChrIns*   (local player character instance)
+//   rdx = int32_t   (SpEffect ID)
+//   r8  = int32_t   (flag; pass 1)
+static const char* ADD_SPEFFECT_PATTERN =
+    "0f 28 0d ? ? ? ? ? 8d ? ? 0f 29 ? ? ? 0f b6 d8";
+
 // Address of the game's WorldChrManImp* static variable.
 // Dereference at hook time to get the live instance pointer.
 uintptr_t* g_worldChrManPtr = nullptr;
 
 DamageFunc_t fpDamageFunc = nullptr;
+
+// Pre-clamp HP-delta wrapper: applies a signed delta, clamps, then forwards to
+// the final HP-write path. Used to capture raw incoming damage before lethal
+// writes collapse to a sentinel or to the victim's remaining HP.
+typedef void(__fastcall* DamageDeltaFunc_t)(
+    uintptr_t statModule, int32_t deltaHp, uint8_t flagA, uint8_t flagB,
+    float arg5, float arg6, uint8_t flagC
+);
+static DamageDeltaFunc_t fpDamageDeltaFunc = nullptr;
+
+// AddSpEffect: apply a SpEffect to a ChrIns immediately.
+// Discovered via The Grand Archives CT-TGA SpEffect_code.cea.
+typedef void(__fastcall* AddSpEffect_t)(uintptr_t chrIns, int32_t spEffectId, int32_t flag);
+static AddSpEffect_t fpAddSpEffect = nullptr;
 
 // Returns true if the 3 bytes at `addr` look like a common x64 MSVC function prologue.
 static bool LooksLikeProlog(uintptr_t addr)
@@ -228,6 +263,25 @@ static uintptr_t GetLocalPlayerStatModule()
     }
 }
 
+// Resolve the local player's ChrIns* — one step shallower than GetLocalPlayerStatModule.
+// This is the object AddSpEffect expects as its first argument (rcx).
+static uintptr_t GetLocalPlayerChrIns()
+{
+    __try
+    {
+        if (!g_worldChrManPtr) return 0;
+        const uintptr_t wcm = *g_worldChrManPtr;
+        if (!wcm) return 0;
+        const uintptr_t arrayBase = *reinterpret_cast<uintptr_t*>(wcm + 0x10EF8);
+        if (!arrayBase) return 0;
+        return *reinterpret_cast<uintptr_t*>(arrayBase); // ChrIns* at slot 0
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return 0;
+    }
+}
+
 // Read the local player's current HP via the stat module.
 // Returns -1 if the chain is not ready or an AV occurs.
 static int32_t ReadLocalPlayerHp()
@@ -247,7 +301,87 @@ static int32_t ReadLocalPlayerHp()
 // game-thread ID. Written once; read by hkRunCallbacks for validation.
 static std::atomic<DWORD> g_gameThreadId{0};
 
+struct PendingDamageContext
+{
+    uintptr_t statModule = 0;
+    int32_t   rawDamage  = 0;
+    ULONGLONG tickMs     = 0;
+    bool      active     = false;
+};
+
+static thread_local PendingDamageContext g_pendingDamage;
+static constexpr ULONGLONG PENDING_DAMAGE_TTL_MS = 250;
+
 static void DrainRemoteDamage(); // defined after ApplyDamageToLocalPlayer
+
+static void ClearPendingDamageContext()
+{
+    g_pendingDamage = {};
+}
+
+static void CapturePendingRawDamage(uintptr_t statModule, int32_t rawDamage)
+{
+    g_pendingDamage.statModule = statModule;
+    g_pendingDamage.rawDamage  = rawDamage;
+    g_pendingDamage.tickMs     = GetTickCount64();
+    g_pendingDamage.active     = true;
+
+    char dbg[160];
+    sprintf_s(dbg,
+              "[SharedDamage] RawDamageCapture: statModule=%p rawDamage=%d\n",
+              reinterpret_cast<void*>(statModule), rawDamage);
+    OutputDebugStringA(dbg);
+    ModUtils::Log("SharedDamage: RawDamageCapture: statModule=%p rawDamage=%d",
+                  (void*)statModule, rawDamage);
+}
+
+static bool TryConsumePendingRawDamage(uintptr_t statModule, int32_t* outDamage)
+{
+    if (!g_pendingDamage.active)
+        return false;
+
+    const ULONGLONG ageMs = GetTickCount64() - g_pendingDamage.tickMs;
+
+    if (g_pendingDamage.statModule != statModule ||
+        g_pendingDamage.rawDamage <= 0 ||
+        ageMs > PENDING_DAMAGE_TTL_MS)
+    {
+        char dbg[192];
+        sprintf_s(dbg,
+                  "[SharedDamage] PendingDamage stale/mismatch: raw=%d ctxStat=%p reqStat=%p ageMs=%llu\n",
+                  g_pendingDamage.rawDamage,
+                  reinterpret_cast<void*>(g_pendingDamage.statModule),
+                  reinterpret_cast<void*>(statModule),
+                  static_cast<unsigned long long>(ageMs));
+        OutputDebugStringA(dbg);
+        ModUtils::Log("SharedDamage: PendingDamage stale/mismatch: raw=%d ctxStat=%p reqStat=%p ageMs=%llu",
+                      g_pendingDamage.rawDamage,
+                      (void*)g_pendingDamage.statModule, (void*)statModule,
+                      static_cast<unsigned long long>(ageMs));
+        ClearPendingDamageContext();
+        return false;
+    }
+
+    *outDamage = g_pendingDamage.rawDamage;
+    ClearPendingDamageContext();
+    return true;
+}
+
+void __fastcall hkDamageDeltaFunc(
+    uintptr_t rcx, int32_t edx, uint8_t r8, uint8_t r9,
+    float arg5, float arg6, uint8_t flagC
+)
+{
+    const uintptr_t localStatModule = GetLocalPlayerStatModule();
+    if (localStatModule && rcx == localStatModule && edx < 0)
+    {
+        const int64_t rawDamage64 = -static_cast<int64_t>(edx);
+        if (rawDamage64 > 0 && rawDamage64 <= INT32_MAX)
+            CapturePendingRawDamage(rcx, static_cast<int32_t>(rawDamage64));
+    }
+
+    fpDamageDeltaFunc(rcx, edx, r8, r9, arg5, arg6, flagC);
+}
 
 void __fastcall hkDamageFunc(uintptr_t rcx, int rdx)
 {
@@ -282,16 +416,38 @@ void __fastcall hkDamageFunc(uintptr_t rcx, int rdx)
     // rdx is the new HP value. Confirm it's a damage event (HP decrease).
     const int32_t currentHp = *reinterpret_cast<int32_t*>(localStatModule + 0x138);
     const int32_t newHp     = rdx;
+    int32_t pendingRawDamage = 0;
+    const bool hasPendingRaw = TryConsumePendingRawDamage(localStatModule, &pendingRawDamage);
 
-    if (newHp >= 0 && newHp < currentHp)
+    if (hasPendingRaw && currentHp > 0 && newHp < currentHp)
     {
+        ModUtils::Log("SharedDamage: Hook fired: using pending raw damage=%d (hp %d -> %d)",
+                      pendingRawDamage, currentHp, newHp);
+        fpDamageFunc(rcx, rdx);
+        BroadcastDamage(pendingRawDamage);
+    }
+    else if (currentHp > 0 && newHp < currentHp)
+    {
+        // Fallback path: game writes currentHp - rawDamage directly, even when negative
+        // (no sentinelization observed at the HP-write level). currentHp - newHp gives
+        // the correct raw damage for both normal hits (newHp >= 0) and lethal overkill
+        // (newHp < 0 because rawDamage > currentHp).
+        // Guard: currentHp > 0 excludes post-death writes where currentHp is already 0;
+        // those satisfy newHp < currentHp but must not generate additional packets.
         const int32_t damage = currentHp - newHp;
-        ModUtils::Log("SharedDamage: Hook fired: damage=%d (hp %d -> %d)", damage, currentHp, newHp);
+        ModUtils::Log("SharedDamage: Hook fired: %s damage=%d (hp %d -> %d)",
+                      newHp < 0 ? "lethal" : "normal", damage, currentHp, newHp);
         fpDamageFunc(rcx, rdx);
         BroadcastDamage(damage);
     }
     else
     {
+        // Either newHp >= currentHp (heal/restore) or currentHp == 0 (post-death write).
+        if (hasPendingRaw)
+        {
+            ModUtils::Log("SharedDamage: Hook fired: pending raw damage=%d ignored because write was not a damage event (hp %d -> %d)",
+                          pendingRawDamage, currentHp, newHp);
+        }
         fpDamageFunc(rcx, rdx);
     }
 }
@@ -542,8 +698,31 @@ void ApplyDamageToLocalPlayer(int32_t damage)
     ModUtils::Log("SharedDamage: ApplyDamageToLocalPlayer: damage=%d hp=%d -> %d",
                   damage, currentHp, newHp);
     fpDamageFunc(statModule, newHp);
+    ApplySharedHitSpEffectToLocalPlayer();
 }
 
+
+void ApplySharedHitSpEffectToLocalPlayer()
+{
+    if (!fpAddSpEffect)
+    {
+        OutputDebugStringA("[SharedDamage] ApplySharedHitSpEffectToLocalPlayer: fpAddSpEffect null — skipping\n");
+        return;
+    }
+    const uintptr_t chrIns = GetLocalPlayerChrIns();
+    if (!chrIns)
+    {
+        OutputDebugStringA("[SharedDamage] ApplySharedHitSpEffectToLocalPlayer: chrIns null — skipping\n");
+        return;
+    }
+    char dbg[128];
+    sprintf_s(dbg, "[SharedDamage] ApplySharedHitSpEffectToLocalPlayer: chrIns=%p spEffect=%d\n",
+              reinterpret_cast<void*>(chrIns), SHARED_ON_HIT_SPEFFECT_ID);
+    OutputDebugStringA(dbg);
+    ModUtils::Log("SharedDamage: ApplySharedHitSpEffectToLocalPlayer: chrIns=%p spEffect=%d",
+                  (void*)chrIns, SHARED_ON_HIT_SPEFFECT_ID);
+    fpAddSpEffect(chrIns, SHARED_ON_HIT_SPEFFECT_ID, 1);
+}
 
 void InitHooks()
 {
@@ -702,6 +881,56 @@ void InitHooks()
     }
 
     // --- Install hooks ---
+    // --- Locate the generic HP-delta wrapper ---
+    // This path sees a signed delta before the final HP write clamps/sentinelizes
+    // lethal hits. We capture the raw incoming damage here and consume it from
+    // hkDamageFunc once the write is confirmed.
+    uintptr_t deltaFuncStart = 0;
+    {
+        const uintptr_t deltaMid = SilentAobScan(HP_DELTA_WRAPPER_PATTERN);
+        if (deltaMid && deltaMid >= HP_DELTA_WRAPPER_BACKTRACK)
+        {
+            deltaFuncStart = deltaMid - HP_DELTA_WRAPPER_BACKTRACK;
+            char dbg[160];
+            sprintf_s(dbg,
+                      "[SharedDamage] HP-delta wrapper found at %p (mid=%p)\n",
+                      reinterpret_cast<void*>(deltaFuncStart),
+                      reinterpret_cast<void*>(deltaMid));
+            OutputDebugStringA(dbg);
+            ModUtils::Log("SharedDamage: HP-delta wrapper found at %p (mid=%p)",
+                          (void*)deltaFuncStart, (void*)deltaMid);
+
+            int matchCount = 1;
+            uintptr_t searchFrom = deltaMid + 1;
+            for (;;)
+            {
+                const uintptr_t next = SilentAobScan(HP_DELTA_WRAPPER_PATTERN, searchFrom);
+                if (!next) break;
+                matchCount++;
+                char warn[160];
+                sprintf_s(warn,
+                          "[SharedDamage] WARNING: HP-delta wrapper pattern not unique â€” match #%d at %p\n",
+                          matchCount, reinterpret_cast<void*>(next));
+                OutputDebugStringA(warn);
+                ModUtils::Log("SharedDamage: WARNING: HP-delta wrapper pattern not unique â€” match #%d at %p",
+                              matchCount, (void*)next);
+                searchFrom = next + 1;
+            }
+            char summary[160];
+            sprintf_s(summary,
+                      "[SharedDamage] HP-delta wrapper pattern total matches: %d\n",
+                      matchCount);
+            OutputDebugStringA(summary);
+            ModUtils::Log("SharedDamage: HP-delta wrapper pattern total matches: %d",
+                          matchCount);
+        }
+        else
+        {
+            OutputDebugStringA("[SharedDamage] HP-delta wrapper pattern not found â€” lethal overkill will fall back to final HP deltas\n");
+            ModUtils::Log("SharedDamage: HP-delta wrapper pattern not found â€” lethal overkill will fall back to final HP deltas");
+        }
+    }
+
     MH_Initialize();
 
     // Hook 1: game's HP-write function — primary drain point for remote damage.
@@ -717,7 +946,26 @@ void InitHooks()
     }
     ModUtils::Log("SharedDamage: Damage hook installed at %p.", (void*)funcStart);
 
-    // Hook 2: SteamAPI_RunCallbacks — reliable game-thread tick for draining
+    // Hook 2: generic HP-delta wrapper — captures raw incoming damage before
+    // lethal writes collapse to a sentinel or to remaining HP.
+    if (deltaFuncStart)
+    {
+        const MH_STATUS deltaStatus = MH_CreateHook(
+            reinterpret_cast<void*>(deltaFuncStart),
+            reinterpret_cast<void*>(&hkDamageDeltaFunc),
+            reinterpret_cast<void**>(&fpDamageDeltaFunc)
+        );
+        if (deltaStatus != MH_OK)
+        {
+            ModUtils::Log("SharedDamage: MH_CreateHook (hp-delta) failed (status %d) — lethal overkill will fall back to final HP deltas.", (int)deltaStatus);
+        }
+        else
+        {
+            ModUtils::Log("SharedDamage: HP-delta hook installed at %p.", (void*)deltaFuncStart);
+        }
+    }
+
+    // Hook 3: SteamAPI_RunCallbacks — reliable game-thread tick for draining
     // remote damage when the local player is idle and hkDamageFunc never fires.
     // ersc calls this from the game thread on every frame; our hook piggybacks.
     const MH_STATUS cbStatus = MH_CreateHookApi(
@@ -735,6 +983,51 @@ void InitHooks()
     }
 
     MH_EnableHook(MH_ALL_HOOKS);
+
+    // --- Locate AddSpEffect ---
+    // Pattern matches mid-function; subtract 0x1D to reach the prologue.
+    // Source: The Grand Archives Elden Ring CT-TGA SpEffect_code.cea
+    {
+        const uintptr_t spEffectMid = SilentAobScan(ADD_SPEFFECT_PATTERN);
+        if (spEffectMid)
+        {
+            fpAddSpEffect = reinterpret_cast<AddSpEffect_t>(spEffectMid - 0x1D);
+            char dbg[128];
+            sprintf_s(dbg, "[SharedDamage] AddSpEffect found at %p (mid=%p)\n",
+                      reinterpret_cast<void*>(fpAddSpEffect),
+                      reinterpret_cast<void*>(spEffectMid));
+            OutputDebugStringA(dbg);
+            ModUtils::Log("SharedDamage: AddSpEffect found at %p (mid=%p)",
+                          (void*)fpAddSpEffect, (void*)spEffectMid);
+
+            // Verify uniqueness — a duplicate would mean we hooked the wrong function.
+            int matchCount = 1;
+            uintptr_t searchFrom = spEffectMid + 1;
+            for (;;)
+            {
+                const uintptr_t next = SilentAobScan(ADD_SPEFFECT_PATTERN, searchFrom);
+                if (!next) break;
+                matchCount++;
+                char warn[128];
+                sprintf_s(warn,
+                          "[SharedDamage] WARNING: AddSpEffect pattern not unique — match #%d at %p\n",
+                          matchCount, reinterpret_cast<void*>(next));
+                OutputDebugStringA(warn);
+                ModUtils::Log("SharedDamage: WARNING: AddSpEffect pattern not unique — match #%d at %p",
+                              matchCount, (void*)next);
+                searchFrom = next + 1;
+            }
+            char summary[128];
+            sprintf_s(summary, "[SharedDamage] AddSpEffect pattern total matches: %d\n", matchCount);
+            OutputDebugStringA(summary);
+            ModUtils::Log("SharedDamage: AddSpEffect pattern total matches: %d", matchCount);
+        }
+        else
+        {
+            OutputDebugStringA("[SharedDamage] AddSpEffect pattern not found — SpEffect will not be applied\n");
+            ModUtils::Log("SharedDamage: AddSpEffect pattern not found — SpEffect will not be applied on receive");
+        }
+    }
 
     OutputDebugStringA("[SharedDamage] InitHooks returning\n");
     ModUtils::Log("SharedDamage: InitHooks returning");

@@ -4,6 +4,9 @@ project(elden-ring-shared-damage C CXX)  # C required to compile ini.c
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Required for ABI compatibility with ELDEN RING / libER containers.
+add_definitions(-D_ITERATOR_DEBUG_LEVEL=0)
+
 # Use MSVC /MD (dynamic CRT) to match the game's runtime
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
@@ -17,6 +20,19 @@ FetchContent_Declare(
     GIT_TAG        master
 )
 FetchContent_MakeAvailable(minhook)
+
+set(LIBER_LOCAL_SOURCE_DIR "${CMAKE_SOURCE_DIR}/libER/libER")
+if(EXISTS "${LIBER_LOCAL_SOURCE_DIR}/CMakeLists.txt")
+    add_subdirectory("${LIBER_LOCAL_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/libER-local")
+else()
+    FetchContent_Declare(
+        libER
+        GIT_REPOSITORY https://github.com/Dasaav-dsv/libER.git
+        GIT_TAG        d8ae5c92719adca4344d8d902b63286b807f562b
+        GIT_SUBMODULES_RECURSE TRUE
+    )
+    FetchContent_MakeAvailable(libER)
+endif()
 
 # inih — populate only (no FetchContent_MakeAvailable) so their CMakeLists is
 # not invoked. ini.c is added directly to our target as a single source file.
@@ -34,6 +50,7 @@ add_library(elden-ring-shared-damage SHARED
     src/dllmain.cpp
     src/hooks.cpp
     src/damage.cpp
+    src/param_patch.cpp
     ${inih_SOURCE_DIR}/ini.c
 )
 
@@ -44,6 +61,7 @@ target_include_directories(elden-ring-shared-damage PRIVATE
 
 target_link_libraries(elden-ring-shared-damage PRIVATE
     minhook
+    libER_static
     psapi
 )
 

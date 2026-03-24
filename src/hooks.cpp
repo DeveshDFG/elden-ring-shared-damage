@@ -58,16 +58,6 @@ static const char* HP_DELTA_WRAPPER_PATTERN =
     "8b d3 f3 0f 10 5c 24 60 48 8b cf";
 static constexpr uintptr_t HP_DELTA_WRAPPER_BACKTRACK = 0x42;
 
-// AddSpEffect mid-function pattern — matches a sequence inside the function body.
-// The function entry is exactly 0x1D (29) bytes before the match.
-// Source: The Grand Archives Elden Ring CT-TGA, SpEffect_code.cea
-// Calling convention (x64 fastcall):
-//   rcx = ChrIns*   (local player character instance)
-//   rdx = int32_t   (SpEffect ID)
-//   r8  = int32_t   (flag; pass 1)
-static const char* ADD_SPEFFECT_PATTERN =
-    "0f 28 0d ? ? ? ? ? 8d ? ? 0f 29 ? ? ? 0f b6 d8";
-
 // Address of the game's WorldChrManImp* static variable.
 // Dereference at hook time to get the live instance pointer.
 uintptr_t* g_worldChrManPtr = nullptr;
@@ -82,11 +72,6 @@ typedef void(__fastcall* DamageDeltaFunc_t)(
     float arg5, float arg6, uint8_t flagC
 );
 static DamageDeltaFunc_t fpDamageDeltaFunc = nullptr;
-
-// AddSpEffect: apply a SpEffect to a ChrIns immediately.
-// Discovered via The Grand Archives CT-TGA SpEffect_code.cea.
-typedef void(__fastcall* AddSpEffect_t)(uintptr_t chrIns, int32_t spEffectId, int32_t flag);
-static AddSpEffect_t fpAddSpEffect = nullptr;
 
 // Returns true if the 3 bytes at `addr` look like a common x64 MSVC function prologue.
 static bool LooksLikeProlog(uintptr_t addr)
@@ -259,25 +244,6 @@ static uintptr_t GetLocalPlayerStatModule()
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         OutputDebugStringA("[SharedDamage] GetLocalPlayerStatModule: access violation caught\n");
-        return 0;
-    }
-}
-
-// Resolve the local player's ChrIns* — one step shallower than GetLocalPlayerStatModule.
-// This is the object AddSpEffect expects as its first argument (rcx).
-static uintptr_t GetLocalPlayerChrIns()
-{
-    __try
-    {
-        if (!g_worldChrManPtr) return 0;
-        const uintptr_t wcm = *g_worldChrManPtr;
-        if (!wcm) return 0;
-        const uintptr_t arrayBase = *reinterpret_cast<uintptr_t*>(wcm + 0x10EF8);
-        if (!arrayBase) return 0;
-        return *reinterpret_cast<uintptr_t*>(arrayBase); // ChrIns* at slot 0
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
         return 0;
     }
 }
@@ -698,30 +664,6 @@ void ApplyDamageToLocalPlayer(int32_t damage)
     ModUtils::Log("SharedDamage: ApplyDamageToLocalPlayer: damage=%d hp=%d -> %d",
                   damage, currentHp, newHp);
     fpDamageFunc(statModule, newHp);
-    ApplySharedHitSpEffectToLocalPlayer();
-}
-
-
-void ApplySharedHitSpEffectToLocalPlayer()
-{
-    if (!fpAddSpEffect)
-    {
-        OutputDebugStringA("[SharedDamage] ApplySharedHitSpEffectToLocalPlayer: fpAddSpEffect null — skipping\n");
-        return;
-    }
-    const uintptr_t chrIns = GetLocalPlayerChrIns();
-    if (!chrIns)
-    {
-        OutputDebugStringA("[SharedDamage] ApplySharedHitSpEffectToLocalPlayer: chrIns null — skipping\n");
-        return;
-    }
-    char dbg[128];
-    sprintf_s(dbg, "[SharedDamage] ApplySharedHitSpEffectToLocalPlayer: chrIns=%p spEffect=%d\n",
-              reinterpret_cast<void*>(chrIns), SHARED_ON_HIT_SPEFFECT_ID);
-    OutputDebugStringA(dbg);
-    ModUtils::Log("SharedDamage: ApplySharedHitSpEffectToLocalPlayer: chrIns=%p spEffect=%d",
-                  (void*)chrIns, SHARED_ON_HIT_SPEFFECT_ID);
-    fpAddSpEffect(chrIns, SHARED_ON_HIT_SPEFFECT_ID, 1);
 }
 
 void InitHooks()
@@ -983,51 +925,6 @@ void InitHooks()
     }
 
     MH_EnableHook(MH_ALL_HOOKS);
-
-    // --- Locate AddSpEffect ---
-    // Pattern matches mid-function; subtract 0x1D to reach the prologue.
-    // Source: The Grand Archives Elden Ring CT-TGA SpEffect_code.cea
-    {
-        const uintptr_t spEffectMid = SilentAobScan(ADD_SPEFFECT_PATTERN);
-        if (spEffectMid)
-        {
-            fpAddSpEffect = reinterpret_cast<AddSpEffect_t>(spEffectMid - 0x1D);
-            char dbg[128];
-            sprintf_s(dbg, "[SharedDamage] AddSpEffect found at %p (mid=%p)\n",
-                      reinterpret_cast<void*>(fpAddSpEffect),
-                      reinterpret_cast<void*>(spEffectMid));
-            OutputDebugStringA(dbg);
-            ModUtils::Log("SharedDamage: AddSpEffect found at %p (mid=%p)",
-                          (void*)fpAddSpEffect, (void*)spEffectMid);
-
-            // Verify uniqueness — a duplicate would mean we hooked the wrong function.
-            int matchCount = 1;
-            uintptr_t searchFrom = spEffectMid + 1;
-            for (;;)
-            {
-                const uintptr_t next = SilentAobScan(ADD_SPEFFECT_PATTERN, searchFrom);
-                if (!next) break;
-                matchCount++;
-                char warn[128];
-                sprintf_s(warn,
-                          "[SharedDamage] WARNING: AddSpEffect pattern not unique — match #%d at %p\n",
-                          matchCount, reinterpret_cast<void*>(next));
-                OutputDebugStringA(warn);
-                ModUtils::Log("SharedDamage: WARNING: AddSpEffect pattern not unique — match #%d at %p",
-                              matchCount, (void*)next);
-                searchFrom = next + 1;
-            }
-            char summary[128];
-            sprintf_s(summary, "[SharedDamage] AddSpEffect pattern total matches: %d\n", matchCount);
-            OutputDebugStringA(summary);
-            ModUtils::Log("SharedDamage: AddSpEffect pattern total matches: %d", matchCount);
-        }
-        else
-        {
-            OutputDebugStringA("[SharedDamage] AddSpEffect pattern not found — SpEffect will not be applied\n");
-            ModUtils::Log("SharedDamage: AddSpEffect pattern not found — SpEffect will not be applied on receive");
-        }
-    }
 
     OutputDebugStringA("[SharedDamage] InitHooks returning\n");
     ModUtils::Log("SharedDamage: InitHooks returning");

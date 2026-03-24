@@ -1,6 +1,7 @@
 #include <windows.h>
 #include "hooks.h"
 #include "damage.h"
+#include "param_patch.h"
 #include <fstream>
 #include "ModUtils.h"
 #include <steam/steam_api.h>
@@ -20,6 +21,7 @@ static DWORD WINAPI ModThread(LPVOID lpParam)
 
     OutputDebugStringA("[SharedDamage] Calling InitHooks\n");
     InitHooks();
+    InitRuntimeParamPatch();
 
     // Poll for incoming damage packets on this thread for the lifetime of the DLL.
     // A second thread caused loader-lock contention (DLL_THREAD_ATTACH had to fire

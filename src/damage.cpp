@@ -1,140 +1,285 @@
 #include "damage.h"
 #include "hooks.h"
-#define NOMINMAX
-#include <fstream>
-#include "ModUtils.h"
-#include <cstdint>
-#include <algorithm>
+#include "shared_damage_boss_diag.h"
+
 #include <steam/steam_api.h>
 
-// Offset reference — verify and update after each Elden Ring patch.
-// WorldChrManImp playerArray:  +0x10EF8  (source: samjviana/souls_vision)
-// Entry::chrIns:               +0x0000   (source: samjviana/souls_vision)
-// Entry stride:                 0x0010   (8-byte ChrIns* + 8-byte pad)
-// ChrIns::moduleBag:           +0x0190   (source: samjviana/souls_vision)
-// ChrModuleBag::statModule:    +0x0000   (source: samjviana/souls_vision)
-// ChrStatModule::hp:           +0x0138   (source: samjviana/souls_vision)
-// Max co-op players:            6        (source: Seamless Co-op player cap)
+#include <algorithm>
+#include <atomic>
+#include <limits>
 
-// --- Lobby tracking via Steam callback ---
-//
-// Seamless Co-op uses ISteamMatchmaking CreateLobby/JoinLobby for session
-// rendezvous. We capture the lobby ID from LobbyEnter_t so BroadcastDamage
-// can enumerate all connected peers via GetLobbyMemberByIndex and send to
-// each one, skipping the local player. No slot-index mapping needed.
-//
-// SteamAPI_RunCallbacks() is called by the game (or ersc.dll) on the main
-// thread; our callback is registered into the same Steam client context and
-// will be dispatched automatically — provided our DLL loads after SteamAPI_Init,
-// which is guaranteed when launched via me3. Watch for the OnLobbyEnter log
-// on first session join to confirm the callback is firing correctly.
 static CSteamID g_lobbyId = k_steamIDNil;
+static std::atomic<int64_t> g_pendingBroadcastDamage{0};
+static bool g_steamDiagStateInitialized = false;
+static uint64_t g_lastDiagLocalSteamId = 0;
+static uint64_t g_lastDiagLobbyId = 0;
+static int g_lastDiagLobbyMemberCount = -1;
 
 class LobbyTracker
 {
 public:
     STEAM_CALLBACK(LobbyTracker, OnLobbyEnter, LobbyEnter_t);
     STEAM_CALLBACK(LobbyTracker, OnLobbyChatUpdate, LobbyChatUpdate_t);
-    STEAM_CALLBACK(LobbyTracker, OnSessionRequest, SteamNetworkingMessagesSessionRequest_t);
-    STEAM_CALLBACK(LobbyTracker, OnSessionFailed, SteamNetworkingMessagesSessionFailed_t);
+    STEAM_CALLBACK(
+        LobbyTracker, OnSessionRequest,
+        SteamNetworkingMessagesSessionRequest_t);
+    STEAM_CALLBACK(
+        LobbyTracker, OnSessionFailed,
+        SteamNetworkingMessagesSessionFailed_t);
 };
 
-void LobbyTracker::OnLobbyEnter(LobbyEnter_t* p)
+void LobbyTracker::OnLobbyEnter(LobbyEnter_t* event)
 {
-    if (p->m_EChatRoomEnterResponse != k_EChatRoomEnterResponseSuccess)
-    {
-        char dbg[128];
-        sprintf_s(dbg,
-                  "[SharedDamage] LobbyEnter: rejected (response=%u)\n",
-                  p->m_EChatRoomEnterResponse);
-        OutputDebugStringA(dbg);
-        ModUtils::Log("SharedDamage: LobbyEnter: rejected (response=%u)",
-                      p->m_EChatRoomEnterResponse);
-        return;
-    }
-    g_lobbyId = CSteamID(p->m_ulSteamIDLobby);
-    const int memberCount = SteamMatchmaking()
-                          ? SteamMatchmaking()->GetNumLobbyMembers(g_lobbyId) : -1;
-    char dbg[192];
-    sprintf_s(dbg,
-              "[SharedDamage] *** LobbyEnter callback FIRED *** lobby=%llu members=%d\n",
-              g_lobbyId.ConvertToUint64(), memberCount);
-    OutputDebugStringA(dbg);
-    ModUtils::Log("SharedDamage: *** LobbyEnter callback FIRED *** lobby=%I64u members=%d",
-                  g_lobbyId.ConvertToUint64(), memberCount);
-}
-
-void LobbyTracker::OnLobbyChatUpdate(LobbyChatUpdate_t* p)
-{
-    // Clear g_lobbyId when the local user leaves or is kicked.
-    if (!SteamUser()) return;
-    const bool localUserChanged =
-        (CSteamID(p->m_ulSteamIDUserChanged) == SteamUser()->GetSteamID());
-    const bool leftOrDisconnected =
-        (p->m_rgfChatMemberStateChange & (k_EChatMemberStateChangeLeft |
-                                          k_EChatMemberStateChangeDisconnected |
-                                          k_EChatMemberStateChangeKicked));
-    if (localUserChanged && leftOrDisconnected)
-    {
-        OutputDebugStringA("[SharedDamage] LobbyChatUpdate: local user left — clearing lobby ID\n");
-        ModUtils::Log("SharedDamage: LobbyChatUpdate: local user left — clearing lobby ID");
+    if (event->m_EChatRoomEnterResponse == k_EChatRoomEnterResponseSuccess)
+        g_lobbyId = CSteamID(event->m_ulSteamIDLobby);
+    else
         g_lobbyId = k_steamIDNil;
-    }
 }
 
-void LobbyTracker::OnSessionRequest(SteamNetworkingMessagesSessionRequest_t* p)
+void LobbyTracker::OnLobbyChatUpdate(LobbyChatUpdate_t* event)
 {
-    if (SteamNetworkingMessages())
-        SteamNetworkingMessages()->AcceptSessionWithUser(p->m_identityRemote);
-    char dbg[128];
-    sprintf_s(dbg, "[SharedDamage] AcceptSessionWithUser: %llu\n",
-              p->m_identityRemote.GetSteamID64());
-    OutputDebugStringA(dbg);
-    ModUtils::Log("SharedDamage: AcceptSessionWithUser: %I64u",
-                  p->m_identityRemote.GetSteamID64());
+    ISteamUser* user = SteamUser();
+    if (!user)
+        return;
+
+    const bool localUserChanged =
+        CSteamID(event->m_ulSteamIDUserChanged) == user->GetSteamID();
+    const bool left =
+        (event->m_rgfChatMemberStateChange &
+         (k_EChatMemberStateChangeLeft |
+          k_EChatMemberStateChangeDisconnected |
+          k_EChatMemberStateChangeKicked)) != 0;
+    if (localUserChanged && left)
+        g_lobbyId = k_steamIDNil;
 }
 
-void LobbyTracker::OnSessionFailed(SteamNetworkingMessagesSessionFailed_t* p)
+void LobbyTracker::OnSessionRequest(
+    SteamNetworkingMessagesSessionRequest_t* event)
 {
-    char dbg[192];
-    sprintf_s(dbg, "[SharedDamage] SteamNetworkingMessagesSessionFailed: peer=%llu\n",
-              p->m_info.m_identityRemote.GetSteamID64());
-    OutputDebugStringA(dbg);
-    ModUtils::Log("SharedDamage: SteamNetworkingMessagesSessionFailed: peer=%I64u",
-                  p->m_info.m_identityRemote.GetSteamID64());
+    if (ISteamNetworkingMessages* messages = SteamNetworkingMessages())
+        messages->AcceptSessionWithUser(event->m_identityRemote);
 }
 
-// Constructed at DLL load time (after SteamAPI_Init in the host EXE).
-// STEAM_CALLBACK registers into the live Steam client context automatically.
+void LobbyTracker::OnSessionFailed(
+    SteamNetworkingMessagesSessionFailed_t*)
+{
+}
+
 static LobbyTracker g_lobbyTracker;
+
+SharedDamageLobbyPresence GetSharedDamageLobbyPresence()
+{
+    if (!g_lobbyId.IsValid())
+        return SharedDamageLobbyPresence::Unknown;
+
+    ISteamMatchmaking* matchmaking = SteamMatchmaking();
+    if (!matchmaking)
+        return SharedDamageLobbyPresence::Unknown;
+
+    const int memberCount = matchmaking->GetNumLobbyMembers(g_lobbyId);
+    if (memberCount < 0)
+        return SharedDamageLobbyPresence::Unknown;
+    if (memberCount < 2)
+        return SharedDamageLobbyPresence::NoRemoteMembers;
+    return SharedDamageLobbyPresence::RemoteMembersPresent;
+}
 
 void BroadcastDamage(int32_t damage)
 {
-    ISteamMatchmaking*        mm   = SteamMatchmaking();
-    ISteamUser*               su   = SteamUser();
-    ISteamNetworkingMessages* msgs = SteamNetworkingMessages();
-    if (!mm || !su || !msgs || !g_lobbyId.IsValid()) return;
-
-    const DamagePacket pkt{ DAMAGE_PACKET_MAGIC, damage };
-    const CSteamID     localId = su->GetSteamID();
-    const int          count   = mm->GetNumLobbyMembers(g_lobbyId);
-
-    for (int i = 0; i < count; i++)
+    if (damage <= 0)
     {
-        const CSteamID member = mm->GetLobbyMemberByIndex(g_lobbyId, i);
-        if (member == localId) continue;
+        SharedDamageBossDiagTryLogBroadcast(
+            damage, false, "nonpositive-damage", 0);
+        return;
+    }
 
+    if (!IsSameWorldActive())
+    {
+        SharedDamageBossDiagTryLogBroadcast(
+            damage, false, "same-world-inactive", 0);
+        return;
+    }
+
+    const int64_t pendingTotal =
+        g_pendingBroadcastDamage.fetch_add(damage, std::memory_order_release) +
+        damage;
+    SharedDamageBossDiagTryLogBroadcast(
+        damage, true, "accepted", pendingTotal);
+}
+
+void DiscardPendingBroadcastDamage()
+{
+    g_pendingBroadcastDamage.store(0, std::memory_order_release);
+}
+
+void LogSharedDamageSteamStateIfChanged(uint64_t callbackInvocationCount)
+{
+    ISteamUser* user = SteamUser();
+    if (!user)
+        return;
+
+    const uint64_t localSteamId = user->GetSteamID().ConvertToUint64();
+    const bool lobbyValid = g_lobbyId.IsValid();
+    const uint64_t lobbyId = lobbyValid ? g_lobbyId.ConvertToUint64() : 0;
+    int lobbyMemberCount = 0;
+    if (lobbyValid)
+    {
+        if (ISteamMatchmaking* matchmaking = SteamMatchmaking())
+            lobbyMemberCount = matchmaking->GetNumLobbyMembers(g_lobbyId);
+        else
+            lobbyMemberCount = -1;
+    }
+
+    const bool changed =
+        !g_steamDiagStateInitialized ||
+        localSteamId != g_lastDiagLocalSteamId ||
+        lobbyId != g_lastDiagLobbyId ||
+        lobbyMemberCount != g_lastDiagLobbyMemberCount;
+    if (!changed)
+        return;
+
+    g_steamDiagStateInitialized = true;
+    g_lastDiagLocalSteamId = localSteamId;
+    g_lastDiagLobbyId = lobbyId;
+    g_lastDiagLobbyMemberCount = lobbyMemberCount;
+    SharedDamageBossDiagTryLogSteamState(
+        localSteamId,
+        lobbyId,
+        lobbyValid,
+        lobbyMemberCount,
+        callbackInvocationCount);
+}
+
+void FlushBroadcastDamage()
+{
+    const int64_t pending =
+        g_pendingBroadcastDamage.exchange(0, std::memory_order_acq_rel);
+    if (pending <= 0)
+        return;
+
+    const DamagePacket packet{
+        DAMAGE_PACKET_MAGIC,
+        static_cast<int32_t>(std::min<int64_t>(
+            pending, std::numeric_limits<int32_t>::max()))};
+    const int32_t packetDamage = packet.damage;
+
+    if (!IsSameWorldActive())
+    {
+        SharedDamageBossDiagTryLogFlush(
+            pending,
+            "discarded-same-world-inactive",
+            0,
+            0,
+            0,
+            0,
+            -1,
+            packetDamage);
+        return;
+    }
+
+    if (!g_lobbyId.IsValid())
+    {
+        SharedDamageBossDiagTryLogFlush(
+            pending,
+            "invalid-lobby",
+            0,
+            0,
+            0,
+            0,
+            -1,
+            packetDamage);
+        return;
+    }
+
+    ISteamMatchmaking* matchmaking = SteamMatchmaking();
+    ISteamUser* user = SteamUser();
+    ISteamNetworkingMessages* messages = SteamNetworkingMessages();
+    if (!matchmaking)
+    {
+        SharedDamageBossDiagTryLogFlush(
+            pending,
+            "steam-matchmaking-unavailable",
+            g_lobbyId.ConvertToUint64(),
+            0,
+            0,
+            0,
+            -1,
+            packetDamage);
+        return;
+    }
+    if (!user)
+    {
+        SharedDamageBossDiagTryLogFlush(
+            pending,
+            "steam-user-unavailable",
+            g_lobbyId.ConvertToUint64(),
+            0,
+            0,
+            0,
+            -1,
+            packetDamage);
+        return;
+    }
+    if (!messages)
+    {
+        SharedDamageBossDiagTryLogFlush(
+            pending,
+            "steam-networking-messages-unavailable",
+            g_lobbyId.ConvertToUint64(),
+            0,
+            0,
+            0,
+            -1,
+            packetDamage);
+        return;
+    }
+
+    const CSteamID localId = user->GetSteamID();
+    SharedDamageBossDiagTryLogLocalSteamId(localId.ConvertToUint64());
+
+    const int memberCount =
+        matchmaking->GetNumLobbyMembers(g_lobbyId);
+    const uint64_t lobbyId = g_lobbyId.ConvertToUint64();
+    const uint64_t localSteamId = localId.ConvertToUint64();
+    bool sentToAnyTarget = false;
+
+    for (int i = 0; i < memberCount; ++i)
+    {
+        const CSteamID member =
+            matchmaking->GetLobbyMemberByIndex(g_lobbyId, i);
+        if (!member.IsValid() || member == localId)
+            continue;
+
+        sentToAnyTarget = true;
         SteamNetworkingIdentity identity;
         identity.SetSteamID(member);
-        const EResult result = msgs->SendMessageToUser(
-            identity, &pkt, sizeof(pkt), k_nSteamNetworkingSend_Reliable, DAMAGE_CHANNEL);
+        const EResult sendResult = messages->SendMessageToUser(
+            identity,
+            &packet,
+            sizeof(packet),
+            k_nSteamNetworkingSend_Reliable,
+            DAMAGE_CHANNEL);
+        SharedDamageBossDiagTryLogFlush(
+            pending,
+            sendResult == k_EResultOK ? "sent" : "send-failed",
+            lobbyId,
+            memberCount,
+            localSteamId,
+            member.ConvertToUint64(),
+            static_cast<int>(sendResult),
+            packetDamage);
+    }
 
-        char dbg[192];
-        sprintf_s(dbg,
-                  "[SharedDamage] BroadcastDamage: peer=%llu damage=%d result=%d\n",
-                  member.ConvertToUint64(), damage, (int)result);
-        OutputDebugStringA(dbg);
-        ModUtils::Log("SharedDamage: BroadcastDamage: peer=%I64u damage=%d result=%d",
-                      member.ConvertToUint64(), damage, (int)result);
+    if (!sentToAnyTarget)
+    {
+        SharedDamageBossDiagTryLogFlush(
+            pending,
+            "no-remote-targets",
+            lobbyId,
+            memberCount,
+            localSteamId,
+            0,
+            -1,
+            packetDamage);
     }
 }

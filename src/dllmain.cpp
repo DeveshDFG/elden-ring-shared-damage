@@ -1,80 +1,91 @@
 #include <windows.h>
-#include "hooks.h"
+
 #include "damage.h"
-#include "param_patch.h"
-#include <fstream>
-#include "ModUtils.h"
+#include "hooks.h"
+#include "shared_damage_boss_diag.h"
+
 #include <steam/steam_api.h>
 
-static DWORD WINAPI ModThread(LPVOID lpParam)
+static DWORD WINAPI ModThread(LPVOID)
 {
-    OutputDebugStringA("[SharedDamage] ModThread started\n");
-
-    char cwd[MAX_PATH];
-    GetCurrentDirectoryA(MAX_PATH, cwd);
-    char cwdMsg[MAX_PATH + 64];
-    sprintf_s(cwdMsg, "[SharedDamage] CWD = %s\n", cwd);
-    OutputDebugStringA(cwdMsg);
-
-    // Log file will be written to: CWD\mods\elden-ring-shared-damage\log.txt
-    ModUtils::Log("SharedDamage: ModThread started");
-
-    OutputDebugStringA("[SharedDamage] Calling InitHooks\n");
+    InitSharedDamageBossDiag();
     InitHooks();
-    InitRuntimeParamPatch();
 
-    // Poll for incoming damage packets on this thread for the lifetime of the DLL.
-    // A second thread caused loader-lock contention (DLL_THREAD_ATTACH had to fire
-    // for every thread spawn while the game held the lock). ModThread is already the
-    // one long-lived mod thread — polling here is the standard pattern.
-    {
-        char dbg[128];
-        sprintf_s(dbg, "[SharedDamage] P2P poll loop starting — channel=%d magic=0x%08X\n",
-                  DAMAGE_CHANNEL, DAMAGE_PACKET_MAGIC);
-        OutputDebugStringA(dbg);
-        ModUtils::Log("SharedDamage: P2P poll loop starting — channel=%d magic=0x%08X",
-                      DAMAGE_CHANNEL, DAMAGE_PACKET_MAGIC);
-    }
     while (true)
     {
-        Sleep(1);
-        ISteamNetworkingMessages* msgs = SteamNetworkingMessages();
-        if (!msgs) continue;
-        SteamNetworkingMessage_t* incoming[16];
-        const int count = msgs->ReceiveMessagesOnChannel(DAMAGE_CHANNEL, incoming, 16);
-        for (int i = 0; i < count; i++)
-        {
-            SteamNetworkingMessage_t* msg = incoming[i];
-            char dbg[256];
-            sprintf_s(dbg,
-                      "[SharedDamage] ReceiveMsg: size=%d from=%llu\n",
-                      msg->m_cbSize, msg->m_identityPeer.GetSteamID64());
-            OutputDebugStringA(dbg);
-            ModUtils::Log("SharedDamage: ReceiveMsg: size=%d from=%I64u",
-                          msg->m_cbSize, msg->m_identityPeer.GetSteamID64());
+        Sleep(5);
 
-            if (msg->m_cbSize == sizeof(DamagePacket))
+        ISteamNetworkingMessages* messages = SteamNetworkingMessages();
+        if (!messages)
+            continue;
+
+        SteamNetworkingMessage_t* incoming[16]{};
+        const int count =
+            messages->ReceiveMessagesOnChannel(DAMAGE_CHANNEL, incoming, 16);
+        for (int i = 0; i < count; ++i)
+        {
+            SteamNetworkingMessage_t* message = incoming[i];
+            const int messageSize = message->m_cbSize;
+            const uint64_t senderSteamId =
+                message->m_identityPeer.GetSteamID64();
+
+            if (messageSize != sizeof(DamagePacket))
             {
-                const DamagePacket* pkt = reinterpret_cast<const DamagePacket*>(msg->m_pData);
-                if (pkt->magic == DAMAGE_PACKET_MAGIC)
-                    EnqueueRemoteDamage(pkt->damage);
+                SharedDamageBossDiagTryLogReceive(
+                    messageSize,
+                    senderSteamId,
+                    false,
+                    "size-mismatch",
+                    0);
+                message->Release();
+                continue;
             }
-            msg->Release();
+
+            const auto* packet =
+                reinterpret_cast<const DamagePacket*>(message->m_pData);
+            if (packet->magic != DAMAGE_PACKET_MAGIC)
+            {
+                SharedDamageBossDiagTryLogReceive(
+                    messageSize,
+                    senderSteamId,
+                    false,
+                    "magic-mismatch",
+                    packet->damage);
+                message->Release();
+                continue;
+            }
+
+            if (packet->damage <= 0)
+            {
+                SharedDamageBossDiagTryLogReceive(
+                    messageSize,
+                    senderSteamId,
+                    false,
+                    "nonpositive-damage",
+                    packet->damage);
+                message->Release();
+                continue;
+            }
+
+            SharedDamageBossDiagTryLogReceive(
+                messageSize,
+                senderSteamId,
+                true,
+                "accepted",
+                packet->damage);
+            EnqueueRemoteDamage(packet->damage);
+            message->Release();
         }
     }
-    return 0;
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
-    OutputDebugStringA("[SharedDamage] DllMain called\n");
-
-    if (ul_reason_for_call == DLL_PROCESS_ATTACH)
+    if (reason == DLL_PROCESS_ATTACH)
     {
-        OutputDebugStringA("[SharedDamage] DLL loaded, built: " __DATE__ " " __TIME__ "\n");
-        OutputDebugStringA("[SharedDamage] DLL_PROCESS_ATTACH\n");
-        DisableThreadLibraryCalls(hModule);
-        CreateThread(nullptr, 0, ModThread, nullptr, 0, nullptr);
+        DisableThreadLibraryCalls(module);
+        if (HANDLE thread = CreateThread(nullptr, 0, ModThread, nullptr, 0, nullptr))
+            CloseHandle(thread);
     }
     return TRUE;
 }

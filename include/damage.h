@@ -19,3 +19,22 @@ struct DamagePacket
 // Broadcast a damage event to all connected peers via Steam P2P.
 // Called by hkDamageFunc after the local HP write is confirmed.
 void BroadcastDamage(int32_t damage);
+
+// Sends the accumulated local damage as one packet. Called from the
+// Steam callback hook once per callback cycle.
+void FlushBroadcastDamage();
+
+// Clears queued outbound damage without sending.
+void DiscardPendingBroadcastDamage();
+
+enum class SharedDamageLobbyPresence : uint8_t
+{
+    Unknown = 0,
+    NoRemoteMembers = 1,
+    RemoteMembersPresent = 2,
+};
+
+SharedDamageLobbyPresence GetSharedDamageLobbyPresence();
+
+// Diagnostic-only Steam identity/lobby snapshot. Does not mutate lobby state.
+void LogSharedDamageSteamStateIfChanged(uint64_t callbackInvocationCount);

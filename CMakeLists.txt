@@ -1,97 +1,102 @@
 cmake_minimum_required(VERSION 3.21)
-project(elden-ring-shared-damage C CXX)  # C required to compile ini.c
+project(elden-ring-shared-damage CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Required for ABI compatibility with ELDEN RING / libER containers.
 add_definitions(-D_ITERATOR_DEBUG_LEVEL=0)
 
-# Use MSVC /MD (dynamic CRT) to match the game's runtime
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
 endif()
 
+option(BUILD_SHARED_DAMAGE_MOD "Build elden-ring-shared-damage.dll" ON)
+option(BUILD_DESTINED_DEATH_MOD "Build elden-ring-destined-death.dll" ON)
+
 include(FetchContent)
 
-FetchContent_Declare(
-    minhook
-    GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
-    GIT_TAG        master
-)
-FetchContent_MakeAvailable(minhook)
-
-set(LIBER_LOCAL_SOURCE_DIR "${CMAKE_SOURCE_DIR}/libER/libER")
-if(EXISTS "${LIBER_LOCAL_SOURCE_DIR}/CMakeLists.txt")
-    add_subdirectory("${LIBER_LOCAL_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/libER-local")
-else()
+if(BUILD_SHARED_DAMAGE_MOD OR BUILD_DESTINED_DEATH_MOD)
     FetchContent_Declare(
-        libER
-        GIT_REPOSITORY https://github.com/Dasaav-dsv/libER.git
-        GIT_TAG        d8ae5c92719adca4344d8d902b63286b807f562b
-        GIT_SUBMODULES_RECURSE TRUE
+        minhook
+        GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
+        GIT_TAG master
     )
-    FetchContent_MakeAvailable(libER)
+    FetchContent_MakeAvailable(minhook)
 endif()
 
-# inih — populate only (no FetchContent_MakeAvailable) so their CMakeLists is
-# not invoked. ini.c is added directly to our target as a single source file.
-FetchContent_Declare(
-    inih
-    GIT_REPOSITORY https://github.com/benhoyt/inih.git
-    GIT_TAG        master
-)
-FetchContent_GetProperties(inih)
-if(NOT inih_POPULATED)
-    FetchContent_Populate(inih)
+if(BUILD_DESTINED_DEATH_MOD)
+    set(LIBER_LOCAL_SOURCE_DIR "${CMAKE_SOURCE_DIR}/libER/libER")
+    if(EXISTS "${LIBER_LOCAL_SOURCE_DIR}/CMakeLists.txt")
+        add_subdirectory(
+            "${LIBER_LOCAL_SOURCE_DIR}"
+            "${CMAKE_BINARY_DIR}/libER-local")
+    else()
+        FetchContent_Declare(
+            libER
+            GIT_REPOSITORY https://github.com/Dasaav-dsv/libER.git
+            GIT_TAG d8ae5c92719adca4344d8d902b63286b807f562b
+            GIT_SUBMODULES_RECURSE TRUE
+        )
+        FetchContent_MakeAvailable(libER)
+    endif()
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
 endif()
 
-add_library(elden-ring-shared-damage SHARED
-    src/dllmain.cpp
-    src/hooks.cpp
-    src/damage.cpp
-    src/param_patch.cpp
-    ${inih_SOURCE_DIR}/ini.c
-)
-
-target_include_directories(elden-ring-shared-damage PRIVATE
-    include
-    ${inih_SOURCE_DIR}
-)
-
-target_link_libraries(elden-ring-shared-damage PRIVATE
-    minhook
-    libER_static
-    psapi
-)
-
-# Steam SDK — point STEAM_SDK_PATH at the root of the Steamworks SDK
-# (the directory that contains public/ and redistributable_bin/).
-# The game ships steam_api64.dll; we only need headers + the import lib.
-# Example: cmake -B build -A x64 -DSTEAM_SDK_PATH=C:/steamworks_sdk_158
-set(STEAM_SDK_PATH "C:/Steam/steamworks_sdk/sdk" CACHE PATH "Path to the Steamworks SDK root directory")
-if(STEAM_SDK_PATH)
-    target_include_directories(elden-ring-shared-damage PRIVATE
-        "${STEAM_SDK_PATH}/public"
+if(BUILD_SHARED_DAMAGE_MOD)
+    add_library(elden-ring-shared-damage SHARED
+        src/dllmain.cpp
+        src/hooks.cpp
+        src/damage.cpp
+        src/shared_damage_boss_diag.cpp
     )
-    target_link_libraries(elden-ring-shared-damage PRIVATE
-        "${STEAM_SDK_PATH}/redistributable_bin/win64/steam_api64.lib"
-    )
-else()
-    message(WARNING
-        "STEAM_SDK_PATH not set — Steam P2P networking will not compile. "
-        "Pass -DSTEAM_SDK_PATH=<path> to cmake or set it in CMakeCache.txt.")
+
+    target_include_directories(elden-ring-shared-damage PRIVATE include)
+    target_link_libraries(elden-ring-shared-damage PRIVATE minhook psapi)
+
+    set(
+        STEAM_SDK_PATH
+        "C:/Steam/steamworks_sdk/sdk"
+        CACHE PATH
+        "Path to the Steamworks SDK root directory")
+    if(STEAM_SDK_PATH)
+        target_include_directories(
+            elden-ring-shared-damage
+            PRIVATE "${STEAM_SDK_PATH}/public")
+        target_link_libraries(
+            elden-ring-shared-damage
+            PRIVATE
+            "${STEAM_SDK_PATH}/redistributable_bin/win64/steam_api64.lib")
+    else()
+        message(FATAL_ERROR "STEAM_SDK_PATH is required for shared damage")
+    endif()
+
+    set_target_properties(elden-ring-shared-damage PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/natives"
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_SOURCE_DIR}/natives"
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_SOURCE_DIR}/natives")
 endif()
 
-# Output the DLL directly into natives/ so me3 can pick it up immediately
-set_target_properties(elden-ring-shared-damage PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY                "${CMAKE_SOURCE_DIR}/natives"
-    RUNTIME_OUTPUT_DIRECTORY_DEBUG          "${CMAKE_SOURCE_DIR}/natives"
-    RUNTIME_OUTPUT_DIRECTORY_RELEASE        "${CMAKE_SOURCE_DIR}/natives"
-)
+if(BUILD_DESTINED_DEATH_MOD)
+    add_library(elden-ring-destined-death SHARED
+        src/destined_death_dllmain.cpp
+        src/destined_death_hooks.cpp
+        src/param_patch.cpp
+    )
 
-# Print the exact path of the built DLL after every build so there's no
-# ambiguity about where the output landed.
-add_custom_command(TARGET elden-ring-shared-damage POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E echo "Built DLL: $<TARGET_FILE:elden-ring-shared-damage>"
-)
+    target_include_directories(elden-ring-destined-death PRIVATE include)
+    target_link_libraries(
+        elden-ring-destined-death
+        PRIVATE libER_static minhook psapi)
+
+    set_target_properties(elden-ring-destined-death PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/natives"
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_SOURCE_DIR}/natives"
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_SOURCE_DIR}/natives")
+
+    add_custom_command(
+        TARGET elden-ring-destined-death PRE_BUILD
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_SOURCE_DIR}/tools/generate_bullet_allowlist.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        COMMENT "Generating Bullet allowlist")
+endif()

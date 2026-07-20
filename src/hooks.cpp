@@ -1,938 +1,1534 @@
 #define NOMINMAX
 #include "hooks.h"
 #include "damage.h"
-#include <fstream>
-#include "ModUtils.h"
-#include <MinHook.h>
-#include <cstdint>
+#include "shared_damage_boss_diag.h"
+
+#include <windows.h>
 #include <psapi.h>
-#include <algorithm>
-#include <atomic>
-#include <mutex>
-#include <set>
-#include <vector>
+#include <MinHook.h>
 #include <steam/steam_api.h>
 
-// WorldChrManImp pointer patterns — RIP-relative MOV, double-dereference.
-// Scan returns address of the instruction; the 4-byte RIP offset sits at +3,
-// instruction size is 7. RelativeToAbsoluteAddress(scan + 3) yields the address
-// of the game's static WorldChrManImp* variable.
-//
-// Two patterns, mirroring the practice tool's fallback list exactly.
-// The primary uses MOV RAX (48 8B 05); the fallback uses MOV RSI (48 8B 35).
-// Both point at WorldChrManImp; both use the same offset/instr-size params (3, 7).
-// Source: veeenu/eldenring-practice-tool aob_scans.rs, samjviana/souls_vision
-static const char* WORLD_CHR_MAN_PATTERN =
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <intrin.h>
+#include <limits>
+#include <sstream>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+namespace
+{
+constexpr const char* WORLD_CHR_MAN_PATTERN =
     "48 8b 05 ? ? ? ? 48 85 c0 74 0f 48 39 88 ? ? ? ? 75 06 89 b1 5c 03 00 00 0f 28 05 ? ? ? ? 4c 8d 45 e7";
-static const char* WORLD_CHR_MAN_PATTERN_FALLBACK =
+constexpr const char* WORLD_CHR_MAN_PATTERN_FALLBACK =
     "48 8b 35 ? ? ? ? 48 85 f6 ? ? bb 01 00 00 00 89 5c 24 20 48 8b b6";
-
-// These patterns locate an instruction WITHIN the damage function, not its entry
-// point. FindFunctionStart() scans backward from the match to find the actual
-// function prologue before handing the address to MinHook.
-//
-// Try the 1.10+ pattern first; fall back to the earlier one.
-// If both fail after a game update, open eldenring.exe in IDA/Ghidra, locate the
-// function containing these bytes, and derive a new AoB from its first instruction.
-// Source: kh0nsu/FromAobScan
-static const char* DAMAGE_PATTERN_LATE =
-    "29 43 08 83 7b 08 00 89 83 ? ? 00 00 7f ? 80 bb ? ? 00 00 00 75 ?";
-static const char* DAMAGE_PATTERN_EARLY =
-    "89 4b 08 48 85 f6 74 ? 48 8d 54 24 ? 48 8b ce e8 ? ? ? ? eb ?";
-// Direct prologue pattern confirmed via x64dbg on 1.16.1.
-// Preferred over mid-function AoB + backward scan — unambiguous, offset = 0.
-// Source: x64dbg inspection of the damage function entry point.
-// Confirmed via Cheat Engine: HP write at RVA 0x437052 (MOV [RCX+138], EAX)
-// is inside sub_7FF7D3CB7000. Prologue bytes verified in x64dbg.
-static const char* DAMAGE_FUNC_PROLOGUE =
+constexpr const char* DAMAGE_FUNC_PROLOGUE =
     "48 89 5c 24 18 48 89 6c 24 20 89 54 24 10 56 57 41 56 48 83 ec 30";
-
-// Generic HP-delta wrapper that computes new HP from a signed delta before
-// forwarding into the final HP-write function. The match sits 0x42 bytes into
-// the wrapper on 1.16.1; subtract that amount to reach the true function entry.
-// Local binary analysis shows this path has multiple callers and is exercised
-// before lethal writes are clamped/sentinelized.
-static const char* HP_DELTA_WRAPPER_PATTERN =
+constexpr const char* HP_DELTA7_WRAPPER_PATTERN =
     "03 9f 38 01 00 00 85 db 7f ? 48 8b cf e8 ? ? ? ? 84 c0 74 ? "
     "bb 01 00 00 00 0f b6 44 24 70 44 0f b6 c6 f3 0f 10 44 24 68 "
     "8b d3 f3 0f 10 5c 24 60 48 8b cf";
-static constexpr uintptr_t HP_DELTA_WRAPPER_BACKTRACK = 0x42;
+constexpr const char* HP_DELTA8_WRAPPER_PATTERN =
+    "48 89 5c 24 08 48 89 6c 24 10 48 89 74 24 18 57 "
+    "48 83 ec 30 41 0f b6 f1 41 0f b6 e8 8b da 48 8b f9 "
+    "85 d2 79 1e e8 ? ? ? ? 44 0f b6 c6 40 0f b6 d5";
+constexpr uintptr_t HP_DELTA7_WRAPPER_BACKTRACK = 0x42;
+constexpr uintptr_t HP_WRITE_EXPECTED_RVA = 0x436EF0;
+constexpr uintptr_t HP_DELTA7_EXPECTED_RVA = 0x4364F0;
+constexpr uintptr_t HP_DELTA8_EXPECTED_RVA = 0x436590;
+constexpr uintptr_t WORLD_CHR_MAN_NET_PLAYERS_OFFSET = 0x10EF8;
+constexpr uintptr_t NET_PLAYERS_SLOT_STRIDE = 0x10;
+constexpr int NET_PLAYERS_LOCAL_SLOT = 0;
+constexpr int NET_PLAYERS_REMOTE_SLOT_FIRST = 1;
+constexpr int NET_PLAYERS_REMOTE_SLOT_LAST = 5;
+constexpr int NET_PLAYERS_PRODUCTION_SLOT_LAST = 5;
+constexpr int NET_PLAYERS_DIAGNOSTIC_SLOT_LAST = 7;
+constexpr uintptr_t kMinValidUserPointer = 0x10000;
 
-// Address of the game's WorldChrManImp* static variable.
-// Dereference at hook time to get the live instance pointer.
-uintptr_t* g_worldChrManPtr = nullptr;
-
-DamageFunc_t fpDamageFunc = nullptr;
-
-// Pre-clamp HP-delta wrapper: applies a signed delta, clamps, then forwards to
-// the final HP-write path. Used to capture raw incoming damage before lethal
-// writes collapse to a sentinel or to the victim's remaining HP.
-typedef void(__fastcall* DamageDeltaFunc_t)(
+using HpDelta7_t = void(__fastcall*)(
     uintptr_t statModule, int32_t deltaHp, uint8_t flagA, uint8_t flagB,
-    float arg5, float arg6, uint8_t flagC
-);
-static DamageDeltaFunc_t fpDamageDeltaFunc = nullptr;
+    float arg5, float arg6, uint8_t flagC);
+using HpDelta8_t = void(__fastcall*)(
+    uintptr_t statModule, int32_t deltaHp, uint8_t flagA, uint8_t flagB,
+    uint8_t flagC, float arg6, float arg7, uint8_t flagD);
+using RunCallbacks_t = void(*)();
 
-// Returns true if the 3 bytes at `addr` look like a common x64 MSVC function prologue.
-static bool LooksLikeProlog(uintptr_t addr)
+HpDelta7_t fpHpDelta7 = nullptr;
+HpDelta8_t fpHpDelta8 = nullptr;
+RunCallbacks_t fpRunCallbacks = nullptr;
+atomic<uintptr_t> g_cachedLocalStatModule{0};
+atomic<int64_t> g_damagePendingTotal{0};
+atomic<bool> g_runCallbacksHookInstalled{false};
+atomic<bool> g_sameWorldActive{false};
+atomic<ULONGLONG> g_nextWorldProbeTickMs{0};
+uint64_t g_worldProbeSampleCount = 0;
+bool g_havePreviousWorldProbe = false;
+SharedDamageSameWorldProbeResult g_previousWorldProbe{};
+
+uintptr_t g_diagPrimaryWorldChrManPtrAddr = 0;
+uintptr_t g_diagFallbackWorldChrManPtrAddr = 0;
+
+enum class PendingDamageSource : uint8_t
 {
-    const uint8_t b0 = *reinterpret_cast<uint8_t*>(addr);
-    const uint8_t b1 = *reinterpret_cast<uint8_t*>(addr + 1);
-    const uint8_t b2 = *reinterpret_cast<uint8_t*>(addr + 2);
-
-    // Reliable x64 MSVC prologue signals only — patterns rare enough in function
-    // bodies that a match at a 16-byte-aligned address strongly implies a start:
-    //
-    //   40/41 + 50-57  — REX.B PUSH r64  (push r8-r15 or REX-prefixed callee-save)
-    //   48 83 EC xx    — SUB RSP, imm8   (frame allocation)
-    //   48 81 EC xx    — SUB RSP, imm32  (large frame allocation)
-    //   48 89 4C/54/5C/74/7C 24  — MOV [RSP+disp8], reg  (incoming arg spill)
-    //
-    // Excluded deliberately:
-    //   53/55/56/57  — bare PUSH RBX/RBP/RSI/RDI: occur constantly mid-function,
-    //                  too many false positives in practice.
-    //   48 8B ??     — MOV reg, [mem]: a load opcode, never a prologue.
-    return ((b0 == 0x40 || b0 == 0x41) && (b1 >= 0x50 && b1 <= 0x57)) ||
-           (b0 == 0x48 && b1 == 0x83 && b2 == 0xEC)                    ||
-           (b0 == 0x48 && b1 == 0x81 && b2 == 0xEC)                    ||
-           (b0 == 0x48 && b1 == 0x89 && (b2 == 0x4C || b2 == 0x54 ||
-                                          b2 == 0x5C || b2 == 0x74 ||
-                                          b2 == 0x7C));
-}
-
-// Scan backward from a mid-function address to find the enclosing function's
-// entry point. Three strategies are tried in order:
-//
-//   1. INT3 (CC) padding — standard MSVC between-function padding.
-//   2. NOP  (90) padding — used by some compilers/obfuscators instead of CC.
-//   3. 16-byte alignment scan — Elden Ring functions are 16-byte aligned;
-//      walk backward in 16-byte steps checking for a valid prologue.
-//      Arxan may use no padding at all, making (1) and (2) unreliable.
-//
-// If all three fail, dumps the 32 bytes before the match to DebugView so the
-// actual padding bytes can be inspected and detection improved.
-//
-// Returns 0 if no suitable start is found within MAX_BACK bytes.
-static uintptr_t FindFunctionStart(uintptr_t midAddr)
-{
-    OutputDebugStringA("[SharedDamage] FindFunctionStart called\n");
-    static const uintptr_t MAX_BACK = 0x500; // 1280 bytes — Arxan functions can be large
-
-    // --- Strategy 1: INT3 (CC) padding ---
-    // Walk backward byte by byte. Every time we land on a CC, skip the full
-    // CC run to find the candidate byte after it. Log the candidate and the
-    // LooksLikeProlog result each time so spurious mid-function CCs are visible.
-    // After a failed LooksLikeProlog the for-loop's p-- steps back one byte and
-    // the scan continues — it does NOT stop at the first CC found.
-    for (uintptr_t p = midAddr - 1; p > midAddr - MAX_BACK; p--)
-    {
-        if (*reinterpret_cast<uint8_t*>(p) != 0xCC)
-            continue;
-
-        // Skip the entire contiguous CC run so candidate points to the byte
-        // immediately after all the padding (or after this lone CC byte).
-        uintptr_t candidate = p + 1;
-        while (*reinterpret_cast<uint8_t*>(candidate) == 0xCC)
-            candidate++;
-
-        if (candidate >= midAddr)
-            break;
-
-        const uint8_t b0 = *reinterpret_cast<const uint8_t*>(candidate);
-        const uint8_t b1 = *reinterpret_cast<const uint8_t*>(candidate + 1);
-        const uint8_t b2 = *reinterpret_cast<const uint8_t*>(candidate + 2);
-        const int     ok = LooksLikeProlog(candidate) ? 1 : 0;
-
-        char dbg[128];
-        sprintf_s(dbg,
-                  "[SharedDamage] S1 candidate %p: %02x %02x %02x -> LooksLikeProlog=%d\n",
-                  reinterpret_cast<void*>(candidate), b0, b1, b2, ok);
-        OutputDebugStringA(dbg);
-
-        if (ok)
-        {
-            OutputDebugStringA("[SharedDamage] FindFunctionStart: found via CC padding\n");
-            return candidate;
-        }
-        // LooksLikeProlog failed — this CC was an operand byte embedded in code,
-        // not inter-function padding. The for-loop's p-- continues the backward
-        // scan naturally; no explicit action needed here.
-    }
-
-    // --- Strategy 2: NOP (90) padding ---
-    for (uintptr_t p = midAddr - 1; p > midAddr - MAX_BACK; p--)
-    {
-        if (*reinterpret_cast<uint8_t*>(p) != 0x90)
-            continue;
-
-        uintptr_t candidate = p + 1;
-        while (*reinterpret_cast<uint8_t*>(candidate) == 0x90)
-            candidate++;
-
-        if (candidate >= midAddr)
-            break;
-
-        if (LooksLikeProlog(candidate))
-        {
-            OutputDebugStringA("[SharedDamage] FindFunctionStart: found via NOP padding\n");
-            return candidate;
-        }
-    }
-
-    // --- Strategy 3: 16-byte alignment scan ---
-    // Round down to nearest 16-byte boundary, then step backward by 16 at a time.
-    // Log every candidate so we can see exactly which addresses are tested and
-    // why a particular one is accepted or rejected.
-    {
-        uintptr_t candidate = midAddr & ~static_cast<uintptr_t>(0xF);
-        const uintptr_t limit = midAddr - MAX_BACK;
-        while (candidate > limit)
-        {
-            const uint8_t b0 = *reinterpret_cast<const uint8_t*>(candidate);
-            const uint8_t b1 = *reinterpret_cast<const uint8_t*>(candidate + 1);
-            const uint8_t b2 = *reinterpret_cast<const uint8_t*>(candidate + 2);
-            const bool    ok = LooksLikeProlog(candidate);
-
-            char dbg[128];
-            sprintf_s(dbg,
-                      "[SharedDamage] S3 check %p (-%zu): %02x %02x %02x -> %s\n",
-                      reinterpret_cast<void*>(candidate), midAddr - candidate,
-                      b0, b1, b2, ok ? "PASS" : "fail");
-            OutputDebugStringA(dbg);
-
-            if (ok)
-                return candidate;
-
-            if (candidate < 16) break;
-            candidate -= 16;
-        }
-    }
-
-    // --- All strategies failed: dump bytes before match for diagnosis ---
-    char hexDump[256] = {};
-    for (int i = -32; i < 0; i++)
-    {
-        char byteStr[8];
-        sprintf_s(byteStr, "%02x ", *reinterpret_cast<uint8_t*>(midAddr + i));
-        strcat_s(hexDump, byteStr);
-    }
-    OutputDebugStringA(("[SharedDamage] FindFunctionStart failed. Bytes before match: " +
-                        std::string(hexDump) + "\n").c_str());
-
-    return 0;
-}
-
-// Resolve the local player's ChrStatModule* from the WorldChrManImp chain.
-// Returns 0 if any link in the chain is null or causes an access violation.
-// Used both in hkDamageFunc (for rcx comparison) and ReadLocalPlayerHp.
-static uintptr_t GetLocalPlayerStatModule()
-{
-    __try
-    {
-        if (!g_worldChrManPtr) return 0;
-        const uintptr_t wcm = *g_worldChrManPtr;
-        if (!wcm) return 0;
-        const uintptr_t arrayBase = *reinterpret_cast<uintptr_t*>(wcm + 0x10EF8);
-        if (!arrayBase) return 0;
-        const uintptr_t chrIns = *reinterpret_cast<uintptr_t*>(arrayBase);
-        if (!chrIns) return 0;
-        const uintptr_t moduleBag = *reinterpret_cast<uintptr_t*>(chrIns + 0x190);
-        if (!moduleBag) return 0;
-        const uintptr_t statModule = *reinterpret_cast<uintptr_t*>(moduleBag);
-        return statModule; // may be 0 — caller checks
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        OutputDebugStringA("[SharedDamage] GetLocalPlayerStatModule: access violation caught\n");
-        return 0;
-    }
-}
-
-// Read the local player's current HP via the stat module.
-// Returns -1 if the chain is not ready or an AV occurs.
-static int32_t ReadLocalPlayerHp()
-{
-    const uintptr_t statModule = GetLocalPlayerStatModule();
-    if (!statModule)
-    {
-        OutputDebugStringA("[SharedDamage] ReadLocalPlayerHp: statModule is null\n");
-        ModUtils::Log("SharedDamage: ReadLocalPlayerHp: statModule is null");
-        return -1;
-    }
-    return *reinterpret_cast<int32_t*>(statModule + 0x138);
-}
-
-// Thread ID of the thread that first invoked hkDamageFunc. MinHook calls our
-// detour on the same thread the game used, so this is the authoritative
-// game-thread ID. Written once; read by hkRunCallbacks for validation.
-static std::atomic<DWORD> g_gameThreadId{0};
+    None = 0,
+    HpDelta7 = 1,
+    HpDelta8 = 2,
+};
 
 struct PendingDamageContext
 {
     uintptr_t statModule = 0;
-    int32_t   rawDamage  = 0;
-    ULONGLONG tickMs     = 0;
-    bool      active     = false;
+    int32_t rawDamage = 0;
+    ULONGLONG tickMs = 0;
+    bool active = false;
+    uint32_t captureSeq = 0;
+    PendingDamageSource sourceWrapper = PendingDamageSource::None;
 };
 
-static thread_local PendingDamageContext g_pendingDamage;
-static constexpr ULONGLONG PENDING_DAMAGE_TTL_MS = 250;
+struct BossPendingConsumeDiag
+{
+    uint32_t pendingSeq = 0;
+    uint64_t pendingAgeMs = 0;
+    const char* result = "no-pending";
+    PendingDamageSource pendingSource = PendingDamageSource::None;
+};
 
-static void DrainRemoteDamage(); // defined after ApplyDamageToLocalPlayer
+thread_local PendingDamageContext g_pendingDamage;
+constexpr ULONGLONG PENDING_DAMAGE_TTL_MS = 250;
+atomic<uint32_t> g_nextCaptureSeq{1};
+SharedDamageWorldSnapshot g_lastProductionSnapshot{};
+atomic<uint32_t> g_nextSnapshotSeq{0};
+
+static uintptr_t GetGameModuleBase()
+{
+    HMODULE module = GetModuleHandleA("eldenring.exe");
+    if (!module)
+        module = GetModuleHandleA(nullptr);
+    return reinterpret_cast<uintptr_t>(module);
+}
+
+static uintptr_t ScanPattern(const char* pattern, uintptr_t startFrom = 0)
+{
+    vector<string> tokens;
+    istringstream stream(pattern);
+    for (string token; stream >> token;)
+        tokens.push_back(token);
+    if (tokens.empty())
+        return 0;
+
+    const uintptr_t moduleBase = GetGameModuleBase();
+    if (!moduleBase)
+        return 0;
+
+    MODULEINFO moduleInfo{};
+    if (!GetModuleInformation(
+            GetCurrentProcess(), reinterpret_cast<HMODULE>(moduleBase),
+            &moduleInfo, sizeof(moduleInfo)))
+        return 0;
+
+    const uintptr_t scanEnd = moduleBase + moduleInfo.SizeOfImage;
+    uintptr_t regionAddress = max(moduleBase, startFrom);
+    MEMORY_BASIC_INFORMATION mbi{};
+
+    while (VirtualQuery(
+               reinterpret_cast<void*>(regionAddress), &mbi, sizeof(mbi)) == sizeof(mbi))
+    {
+        const uintptr_t regionBase = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        if (regionBase >= scanEnd)
+            break;
+
+        const DWORD protection = mbi.Protect & 0xff;
+        const bool readable =
+            mbi.State == MEM_COMMIT &&
+            (protection == PAGE_READONLY ||
+             protection == PAGE_READWRITE ||
+             protection == PAGE_WRITECOPY ||
+             protection == PAGE_EXECUTE_READ ||
+             protection == PAGE_EXECUTE_READWRITE ||
+             protection == PAGE_EXECUTE_WRITECOPY);
+
+        if (readable)
+        {
+            const uintptr_t regionEnd = min(regionBase + mbi.RegionSize, scanEnd);
+            const uintptr_t scanStart = max(regionBase, startFrom);
+            for (uintptr_t current = scanStart;
+                 current + tokens.size() <= regionEnd;
+                 ++current)
+            {
+                bool matches = true;
+                for (size_t i = 0; i < tokens.size(); ++i)
+                {
+                    if (tokens[i] == "?")
+                        continue;
+                    const auto expected =
+                        static_cast<uint8_t>(stoul(tokens[i], nullptr, 16));
+                    if (*reinterpret_cast<const uint8_t*>(current + i) != expected)
+                    {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches)
+                    return current;
+            }
+        }
+
+        const uintptr_t next = regionBase + mbi.RegionSize;
+        if (next <= regionAddress)
+            break;
+        regionAddress = next;
+    }
+
+    return 0;
+}
+
+static uintptr_t ScanUniquePattern(const char* pattern)
+{
+    const uintptr_t first = ScanPattern(pattern);
+    if (!first)
+        return 0;
+    return ScanPattern(pattern, first + 1) ? 0 : first;
+}
+
+static uint32_t CountPatternMatches(const char* pattern)
+{
+    uint32_t count = 0;
+    uintptr_t searchFrom = 0;
+    while (true)
+    {
+        const uintptr_t match = ScanPattern(pattern, searchFrom);
+        if (!match)
+            break;
+        ++count;
+        searchFrom = match + 1;
+    }
+    return count;
+}
+
+static uintptr_t ResolveRipRelative(uintptr_t displacementAddress)
+{
+    const int32_t displacement =
+        *reinterpret_cast<const int32_t*>(displacementAddress);
+    return displacementAddress + sizeof(displacement) + displacement;
+}
+
+static uintptr_t ToRva(uintptr_t address)
+{
+    const uintptr_t moduleBase = GetGameModuleBase();
+    return moduleBase && address >= moduleBase ? address - moduleBase : 0;
+}
+
+static bool LookupPdataRange(
+    uintptr_t address, uintptr_t& begin, uintptr_t& end)
+{
+    DWORD64 imageBase = 0;
+    RUNTIME_FUNCTION* runtimeFunction =
+        RtlLookupFunctionEntry(address, &imageBase, nullptr);
+    if (!runtimeFunction)
+        return false;
+    begin = imageBase + runtimeFunction->BeginAddress;
+    end = imageBase + runtimeFunction->EndAddress;
+    return true;
+}
+
+static bool ValidateFunctionEntry(
+    uintptr_t entry,
+    uintptr_t expectedEntryRva,
+    uintptr_t& pdataBeginRva,
+    uintptr_t& pdataEndRva)
+{
+    pdataBeginRva = 0;
+    pdataEndRva = 0;
+    if (!entry)
+        return false;
+
+    const uintptr_t moduleBase = GetGameModuleBase();
+    if (!moduleBase)
+        return false;
+
+    uintptr_t pdataBegin = 0;
+    uintptr_t pdataEnd = 0;
+    if (!LookupPdataRange(entry, pdataBegin, pdataEnd))
+        return false;
+
+    pdataBeginRva = ToRva(pdataBegin);
+    pdataEndRva = ToRva(pdataEnd);
+    return pdataBeginRva == expectedEntryRva;
+}
+
+static SharedDamageWorldChrManCandidateDiag ResolveWorldChrManCandidate(
+    const char* pattern)
+{
+    SharedDamageWorldChrManCandidateDiag candidate{};
+    candidate.patternMatches = CountPatternMatches(pattern);
+    if (candidate.patternMatches != 1)
+        return candidate;
+
+    const uintptr_t instruction = ScanUniquePattern(pattern);
+    if (!instruction)
+        return candidate;
+
+    candidate.instructionRva = ToRva(instruction);
+    candidate.pointerAddress = ResolveRipRelative(instruction + 3);
+    __try
+    {
+        candidate.currentValue =
+            *reinterpret_cast<uintptr_t*>(candidate.pointerAddress);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        candidate.currentValue = 0;
+    }
+    return candidate;
+}
+
+static void OnSameWorldBecameInactive(bool onGameThread);
+
+static uintptr_t WaitForWorldChrMan()
+{
+    uintptr_t pointerAddress = 0;
+    while (!pointerAddress)
+    {
+        const uintptr_t instruction =
+            ScanUniquePattern(WORLD_CHR_MAN_PATTERN_FALLBACK);
+        if (instruction)
+            pointerAddress = ResolveRipRelative(instruction + 3);
+        else
+            Sleep(2000);
+    }
+
+    for (int attempt = 0; attempt < 600; ++attempt)
+    {
+        if (*reinterpret_cast<uintptr_t*>(pointerAddress))
+            break;
+        Sleep(100);
+    }
+    return pointerAddress;
+}
+
+static bool TryReadPointer(uintptr_t address, uintptr_t& value)
+{
+    value = 0;
+    if (address < kMinValidUserPointer)
+        return false;
+
+    __try
+    {
+        value = *reinterpret_cast<uintptr_t*>(address);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        value = 0;
+        return false;
+    }
+}
+
+static SharedDamageWorldSnapshot CaptureProductionWorldSnapshot()
+{
+    SharedDamageWorldSnapshot snapshot{};
+    if (!g_worldChrManPtr)
+        return snapshot;
+
+    snapshot.worldChrManPointerAddress =
+        reinterpret_cast<uintptr_t>(g_worldChrManPtr);
+
+    uintptr_t worldChrMan = 0;
+    if (!TryReadPointer(snapshot.worldChrManPointerAddress, worldChrMan) ||
+        !worldChrMan)
+        return snapshot;
+
+    snapshot.netPlayersSnapshot.worldChrMan = worldChrMan;
+    snapshot.worldChrManReadable = true;
+
+    uintptr_t netPlayers = 0;
+    if (!TryReadPointer(
+            worldChrMan + WORLD_CHR_MAN_NET_PLAYERS_OFFSET, netPlayers) ||
+        !netPlayers)
+        return snapshot;
+
+    snapshot.netPlayersSnapshot.netPlayers = netPlayers;
+    snapshot.netPlayersReadable = true;
+
+    for (int slot = NET_PLAYERS_LOCAL_SLOT;
+         slot <= NET_PLAYERS_PRODUCTION_SLOT_LAST;
+         ++slot)
+    {
+        uintptr_t chrIns = 0;
+        if (!TryReadPointer(
+                netPlayers + NET_PLAYERS_SLOT_STRIDE * slot, chrIns))
+            return snapshot;
+
+        snapshot.netPlayersSnapshot.slots[slot] = chrIns;
+        if (!chrIns)
+            continue;
+
+        uintptr_t vtable = 0;
+        if (!TryReadPointer(chrIns, vtable) || !vtable)
+            return snapshot;
+
+        snapshot.netPlayersSnapshot.vtables[slot] = vtable;
+    }
+    snapshot.productionSlotsReadComplete = true;
+
+    snapshot.localChrIns =
+        snapshot.netPlayersSnapshot.slots[NET_PLAYERS_LOCAL_SLOT];
+    if (!snapshot.localChrIns ||
+        !snapshot.netPlayersSnapshot.vtables[NET_PLAYERS_LOCAL_SLOT])
+        return snapshot;
+
+    uintptr_t moduleBag = 0;
+    if (!TryReadPointer(snapshot.localChrIns + 0x190, moduleBag) ||
+        !moduleBag)
+        return snapshot;
+    snapshot.localModuleBag = moduleBag;
+
+    uintptr_t statModule = 0;
+    if (!TryReadPointer(moduleBag, statModule) || !statModule)
+        return snapshot;
+    snapshot.localStatModule = statModule;
+    snapshot.localPlayerResolved = true;
+
+    bool remotePresent = false;
+    for (int slot = NET_PLAYERS_REMOTE_SLOT_FIRST;
+         slot <= NET_PLAYERS_REMOTE_SLOT_LAST;
+         ++slot)
+    {
+        if (snapshot.netPlayersSnapshot.slots[slot] != 0 &&
+            snapshot.netPlayersSnapshot.vtables[slot] != 0)
+        {
+            remotePresent = true;
+            break;
+        }
+    }
+
+    snapshot.presence = remotePresent
+        ? SharedWorldPresence::RemotePlayersPresent
+        : SharedWorldPresence::NoRemotePlayers;
+
+    // Diagnostic-only: slots 6–7 never affect production presence/cache.
+    for (int slot = NET_PLAYERS_PRODUCTION_SLOT_LAST + 1;
+         slot <= NET_PLAYERS_DIAGNOSTIC_SLOT_LAST;
+         ++slot)
+    {
+        uintptr_t chrIns = 0;
+        if (!TryReadPointer(
+                netPlayers + NET_PLAYERS_SLOT_STRIDE * slot, chrIns))
+            continue;
+
+        snapshot.netPlayersSnapshot.slots[slot] = chrIns;
+        if (!chrIns)
+            continue;
+
+        uintptr_t vtable = 0;
+        if (TryReadPointer(chrIns, vtable) && vtable)
+            snapshot.netPlayersSnapshot.vtables[slot] = vtable;
+    }
+
+    return snapshot;
+}
+
+static void UpdateProductionFromSnapshot(
+    const SharedDamageWorldSnapshot& snapshot,
+    SharedDamageLobbyPresence lobbyPresence,
+    bool onGameThread,
+    bool& queuesCleared,
+    const char*& transitionReason)
+{
+    queuesCleared = false;
+    transitionReason = "none";
+
+    switch (snapshot.presence)
+    {
+    case SharedWorldPresence::RemotePlayersPresent:
+        if (snapshot.localPlayerResolved)
+        {
+            g_cachedLocalStatModule.store(
+                snapshot.localStatModule, memory_order_release);
+        }
+        if (!g_sameWorldActive.load(memory_order_acquire))
+            transitionReason = "remote-present";
+        g_sameWorldActive.store(true, memory_order_release);
+        break;
+
+    case SharedWorldPresence::NoRemotePlayers:
+        if (snapshot.localPlayerResolved)
+        {
+            g_cachedLocalStatModule.store(
+                snapshot.localStatModule, memory_order_release);
+        }
+        if (g_sameWorldActive.load(memory_order_acquire))
+        {
+            transitionReason = "no-remote-players";
+            g_sameWorldActive.store(false, memory_order_release);
+            OnSameWorldBecameInactive(onGameThread);
+            g_cachedLocalStatModule.store(0, memory_order_release);
+            queuesCleared = true;
+        }
+        break;
+
+    case SharedWorldPresence::Unavailable:
+    default:
+        transitionReason = "unavailable";
+        break;
+    }
+
+    if (lobbyPresence == SharedDamageLobbyPresence::NoRemoteMembers &&
+        g_sameWorldActive.load(memory_order_acquire))
+    {
+        transitionReason = "lobby-below-two";
+        g_sameWorldActive.store(false, memory_order_release);
+        OnSameWorldBecameInactive(onGameThread);
+        g_cachedLocalStatModule.store(0, memory_order_release);
+        queuesCleared = true;
+    }
+}
+
+static void InitializeProductionFromSnapshot(
+    const SharedDamageWorldSnapshot& snapshot,
+    SharedDamageLobbyPresence lobbyPresence)
+{
+    if (snapshot.localPlayerResolved)
+    {
+        g_cachedLocalStatModule.store(
+            snapshot.localStatModule, memory_order_release);
+    }
+
+    bool queuesCleared = false;
+    const char* transitionReason = "none";
+    UpdateProductionFromSnapshot(
+        snapshot, lobbyPresence, false, queuesCleared, transitionReason);
+
+    if (snapshot.presence == SharedWorldPresence::Unavailable)
+        g_sameWorldActive.store(false, memory_order_release);
+}
+
+static void ResolveSlotDiagnosticFields(
+    SharedDamageBossNetPlayersSnapshot& snapshot, int slot)
+{
+    __try
+    {
+        const uintptr_t chrIns = snapshot.slots[slot];
+        if (!chrIns)
+            return;
+        snapshot.moduleBags[slot] =
+            *reinterpret_cast<uintptr_t*>(chrIns + 0x190);
+        if (!snapshot.moduleBags[slot])
+            return;
+        snapshot.statModules[slot] =
+            *reinterpret_cast<uintptr_t*>(snapshot.moduleBags[slot]);
+        if (!snapshot.statModules[slot])
+            return;
+        snapshot.currentHps[slot] = *reinterpret_cast<int32_t*>(
+            snapshot.statModules[slot] + 0x138);
+        snapshot.currentHpReadable[slot] = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        snapshot.currentHpReadable[slot] = false;
+    }
+}
+
+static void PopulateSlotDiagnosticFields(
+    SharedDamageSameWorldProbeResult& probe)
+{
+    if constexpr (!kBossDiagnosticsEnabled)
+        return;
+    for (int slot = 0; slot < 8; ++slot)
+        ResolveSlotDiagnosticFields(probe.snapshot, slot);
+}
+
+static int FindMatchingStatModuleSlot(
+    const SharedDamageBossNetPlayersSnapshot& snapshot,
+    uintptr_t statModule)
+{
+    if (!statModule)
+        return -1;
+    for (int slot = 0; slot < 8; ++slot)
+    {
+        if (snapshot.statModules[slot] == statModule)
+            return slot;
+    }
+    return -1;
+}
+
+static bool WorldProbeLayoutChanged(
+    const SharedDamageSameWorldProbeResult& previous,
+    const SharedDamageSameWorldProbeResult& current)
+{
+    if (previous.active != current.active ||
+        previous.snapshot.worldChrMan != current.snapshot.worldChrMan ||
+        previous.snapshot.netPlayers != current.snapshot.netPlayers)
+        return true;
+    for (int slot = 0; slot < 8; ++slot)
+    {
+        if (previous.snapshot.slots[slot] != current.snapshot.slots[slot] ||
+            previous.snapshot.vtables[slot] != current.snapshot.vtables[slot])
+            return true;
+    }
+    return false;
+}
+
+static SharedDamageSameWorldProbeResult ProbeWorldChrManCandidate(
+    uintptr_t pointerAddress)
+{
+    SharedDamageSameWorldProbeResult result{};
+    if (!pointerAddress)
+        return result;
+
+    uintptr_t worldChrMan = 0;
+    if (!TryReadPointer(pointerAddress, worldChrMan) || !worldChrMan)
+        return result;
+    result.snapshot.worldChrMan = worldChrMan;
+
+    uintptr_t netPlayers = 0;
+    if (!TryReadPointer(
+            worldChrMan + WORLD_CHR_MAN_NET_PLAYERS_OFFSET, netPlayers) ||
+        !netPlayers)
+        return result;
+    result.snapshot.netPlayers = netPlayers;
+
+    for (int slot = NET_PLAYERS_LOCAL_SLOT;
+         slot <= NET_PLAYERS_PRODUCTION_SLOT_LAST;
+         ++slot)
+    {
+        uintptr_t chrIns = 0;
+        if (!TryReadPointer(
+                netPlayers + NET_PLAYERS_SLOT_STRIDE * slot, chrIns))
+            return result;
+
+        result.snapshot.slots[slot] = chrIns;
+        if (!chrIns)
+            continue;
+
+        uintptr_t vtable = 0;
+        if (!TryReadPointer(chrIns, vtable) || !vtable)
+            return result;
+        result.snapshot.vtables[slot] = vtable;
+    }
+
+    for (int slot = NET_PLAYERS_REMOTE_SLOT_FIRST;
+         slot <= NET_PLAYERS_REMOTE_SLOT_LAST;
+         ++slot)
+    {
+        if (result.snapshot.slots[slot] != 0 &&
+            result.snapshot.vtables[slot] != 0)
+        {
+            result.active = true;
+            break;
+        }
+    }
+
+    for (int slot = NET_PLAYERS_PRODUCTION_SLOT_LAST + 1;
+         slot <= NET_PLAYERS_DIAGNOSTIC_SLOT_LAST;
+         ++slot)
+    {
+        uintptr_t chrIns = 0;
+        if (!TryReadPointer(
+                netPlayers + NET_PLAYERS_SLOT_STRIDE * slot, chrIns))
+            continue;
+
+        result.snapshot.slots[slot] = chrIns;
+        if (!chrIns)
+            continue;
+
+        uintptr_t vtable = 0;
+        if (TryReadPointer(chrIns, vtable) && vtable)
+            result.snapshot.vtables[slot] = vtable;
+    }
+
+    return result;
+}
+
+static void LogBossDiagStartup(
+    bool hpWriteHookEnabled,
+    bool hpDelta7HookEnabled,
+    bool hpDelta8HookEnabled,
+    bool callbacksHookEnabled,
+    bool sharingReady,
+    const SharedDamageHookInstallDiag& installDiag,
+    const SharedDamageWorldSnapshot& snapshot)
+{
+    SharedDamageBossDiagLogStartup(
+        hpWriteHookEnabled,
+        hpDelta7HookEnabled,
+        hpDelta8HookEnabled,
+        callbacksHookEnabled,
+        sharingReady,
+        snapshot.netPlayersSnapshot,
+        installDiag);
+}
 
 static void ClearPendingDamageContext()
 {
     g_pendingDamage = {};
 }
 
-static void CapturePendingRawDamage(uintptr_t statModule, int32_t rawDamage)
+static void OnSameWorldBecameInactive(bool onGameThread)
 {
-    g_pendingDamage.statModule = statModule;
-    g_pendingDamage.rawDamage  = rawDamage;
-    g_pendingDamage.tickMs     = GetTickCount64();
-    g_pendingDamage.active     = true;
-
-    char dbg[160];
-    sprintf_s(dbg,
-              "[SharedDamage] RawDamageCapture: statModule=%p rawDamage=%d\n",
-              reinterpret_cast<void*>(statModule), rawDamage);
-    OutputDebugStringA(dbg);
-    ModUtils::Log("SharedDamage: RawDamageCapture: statModule=%p rawDamage=%d",
-                  (void*)statModule, rawDamage);
+    g_damagePendingTotal.store(0, memory_order_release);
+    DiscardPendingBroadcastDamage();
+    if (onGameThread)
+        ClearPendingDamageContext();
 }
 
-static bool TryConsumePendingRawDamage(uintptr_t statModule, int32_t* outDamage)
+static const char* PendingSourceToString(PendingDamageSource source)
 {
+    switch (source)
+    {
+    case PendingDamageSource::HpDelta7:
+        return "hp-delta-7";
+    case PendingDamageSource::HpDelta8:
+        return "hp-delta-8";
+    default:
+        return "none";
+    }
+}
+
+static uint32_t TryCapturePendingRawDamage(
+    uintptr_t statModule,
+    int32_t deltaHp,
+    PendingDamageSource sourceWrapper)
+{
+    if (deltaHp >= 0)
+        return 0;
+
+    const uintptr_t local =
+        g_cachedLocalStatModule.load(memory_order_acquire);
+    if (local == 0 || statModule != local)
+        return 0;
+
+    const int64_t rawDamage64 = -static_cast<int64_t>(deltaHp);
+    if (rawDamage64 > numeric_limits<int32_t>::max())
+        return 0;
+
+    const uint32_t captureSeq =
+        g_nextCaptureSeq.fetch_add(1, memory_order_relaxed);
+    g_pendingDamage = {
+        statModule,
+        static_cast<int32_t>(rawDamage64),
+        GetTickCount64(),
+        true,
+        captureSeq,
+        sourceWrapper};
+    return captureSeq;
+}
+
+static bool TryConsumePendingRawDamage(
+    uintptr_t statModule,
+    int32_t& damage,
+    BossPendingConsumeDiag* diag)
+{
+    if (diag)
+    {
+        diag->pendingSeq = 0;
+        diag->pendingAgeMs = 0;
+        diag->result = "no-pending";
+        diag->pendingSource = PendingDamageSource::None;
+    }
+
     if (!g_pendingDamage.active)
         return false;
 
-    const ULONGLONG ageMs = GetTickCount64() - g_pendingDamage.tickMs;
-
-    if (g_pendingDamage.statModule != statModule ||
-        g_pendingDamage.rawDamage <= 0 ||
-        ageMs > PENDING_DAMAGE_TTL_MS)
+    if (diag)
     {
-        char dbg[192];
-        sprintf_s(dbg,
-                  "[SharedDamage] PendingDamage stale/mismatch: raw=%d ctxStat=%p reqStat=%p ageMs=%llu\n",
-                  g_pendingDamage.rawDamage,
-                  reinterpret_cast<void*>(g_pendingDamage.statModule),
-                  reinterpret_cast<void*>(statModule),
-                  static_cast<unsigned long long>(ageMs));
-        OutputDebugStringA(dbg);
-        ModUtils::Log("SharedDamage: PendingDamage stale/mismatch: raw=%d ctxStat=%p reqStat=%p ageMs=%llu",
-                      g_pendingDamage.rawDamage,
-                      (void*)g_pendingDamage.statModule, (void*)statModule,
-                      static_cast<unsigned long long>(ageMs));
-        ClearPendingDamageContext();
+        diag->pendingSeq = g_pendingDamage.captureSeq;
+        diag->pendingSource = g_pendingDamage.sourceWrapper;
+    }
+
+    if (diag)
+        diag->pendingAgeMs = GetTickCount64() - g_pendingDamage.tickMs;
+
+    if (g_pendingDamage.statModule != statModule)
+    {
+        if (diag)
+            diag->result = "stat-mismatch";
+        g_pendingDamage = {};
         return false;
     }
 
-    *outDamage = g_pendingDamage.rawDamage;
-    ClearPendingDamageContext();
+    if (g_pendingDamage.rawDamage <= 0)
+    {
+        if (diag)
+            diag->result = "invalid-damage";
+        g_pendingDamage = {};
+        return false;
+    }
+
+    const ULONGLONG age = GetTickCount64() - g_pendingDamage.tickMs;
+    if (age > PENDING_DAMAGE_TTL_MS)
+    {
+        if (diag)
+            diag->result = "expired";
+        g_pendingDamage = {};
+        return false;
+    }
+
+    damage = g_pendingDamage.rawDamage;
+    if (diag)
+        diag->result = "matched";
+    g_pendingDamage = {};
     return true;
 }
 
-void __fastcall hkDamageDeltaFunc(
-    uintptr_t rcx, int32_t edx, uint8_t r8, uint8_t r9,
-    float arg5, float arg6, uint8_t flagC
-)
+struct ProductionSnapshotUpdateResult
 {
-    const uintptr_t localStatModule = GetLocalPlayerStatModule();
-    if (localStatModule && rcx == localStatModule && edx < 0)
+    bool latchedBefore = false;
+    bool latchedAfter = false;
+    bool queuesCleared = false;
+    const char* transitionReason = "none";
+    SharedDamageLobbyPresence lobbyPresence =
+        SharedDamageLobbyPresence::Unknown;
+};
+
+static ProductionSnapshotUpdateResult PublishProductionSnapshot(
+    const SharedDamageWorldSnapshot& snapshot,
+    bool onGameThread)
+{
+    g_lastProductionSnapshot = snapshot;
+
+    ProductionSnapshotUpdateResult result{};
+    result.latchedBefore =
+        g_sameWorldActive.load(memory_order_acquire);
+    result.lobbyPresence = GetSharedDamageLobbyPresence();
+
+    UpdateProductionFromSnapshot(
+        snapshot,
+        result.lobbyPresence,
+        onGameThread,
+        result.queuesCleared,
+        result.transitionReason);
+
+    result.latchedAfter =
+        g_sameWorldActive.load(memory_order_acquire);
+
+    if (result.latchedBefore != result.latchedAfter)
     {
-        const int64_t rawDamage64 = -static_cast<int64_t>(edx);
-        if (rawDamage64 > 0 && rawDamage64 <= INT32_MAX)
-            CapturePendingRawDamage(rcx, static_cast<int32_t>(rawDamage64));
+        SharedDamageBossDiagLogSameWorldTransition(
+            result.latchedBefore,
+            result.latchedAfter,
+            snapshot.netPlayersSnapshot);
     }
 
-    fpDamageDeltaFunc(rcx, edx, r8, r9, arg5, arg6, flagC);
+    return result;
 }
 
-void __fastcall hkDamageFunc(uintptr_t rcx, int rdx)
+static void TryLogUnifiedProductionSnapshot(
+    const SharedDamageWorldSnapshot& snapshot,
+    const ProductionSnapshotUpdateResult& update,
+    uint64_t callbackInvocationCount,
+    const char* snapshotSource)
 {
-    // Record the game thread ID on first invocation — MinHook calls us on the
-    // same thread the game used, so this is more reliable than DllMain's TID.
-    {
-        DWORD expected = 0;
-        g_gameThreadId.compare_exchange_strong(expected, GetCurrentThreadId(),
-                                               std::memory_order_relaxed);
-    }
+    const uint32_t snapshotSeq =
+        g_nextSnapshotSeq.fetch_add(1, memory_order_relaxed) + 1;
+    SharedDamageBossDiagTryLogUnifiedWorldSnapshot(
+        snapshotSeq,
+        callbackInvocationCount,
+        snapshot,
+        update.latchedBefore,
+        update.latchedAfter,
+        update.lobbyPresence,
+        update.transitionReason,
+        update.queuesCleared,
+        snapshotSource);
+}
 
-    // Fast path: WorldChrManImp not ready yet.
-    if (!g_worldChrManPtr || !*g_worldChrManPtr)
+static void DrainRemoteDamageFromSnapshot(
+    uintptr_t localStatModule,
+    bool localPlayerResolved,
+    SharedWorldPresence presence)
+{
+    const int64_t pending =
+        g_damagePendingTotal.exchange(0, memory_order_acq_rel);
+    if (pending <= 0)
+        return;
+
+    const int32_t damage = static_cast<int32_t>(
+        min<int64_t>(pending, numeric_limits<int32_t>::max()));
+
+    if (!IsSameWorldActive())
     {
-        fpDamageFunc(rcx, rdx);
+        SharedDamageBossDiagTryLogDrainApply(
+            pending,
+            false,
+            "same-world-inactive",
+            damage,
+            -1,
+            -1);
         return;
     }
 
-    // Drain any damage queued by the poll thread — applied here on the game
-    // thread so fpDamageFunc is never called from a background thread.
-    DrainRemoteDamage();
-
-    // rcx is the ChrStatModule* the game is writing new HP into.
-    // Only act if it matches the local player's statModule.
-    const uintptr_t localStatModule = GetLocalPlayerStatModule();
-    if (!localStatModule || rcx != localStatModule)
+    if (presence == SharedWorldPresence::Unavailable)
     {
-        fpDamageFunc(rcx, rdx);
+        SharedDamageBossDiagTryLogDrainApply(
+            pending,
+            false,
+            "current-snapshot-unavailable",
+            damage,
+            -1,
+            -1);
         return;
     }
 
-    // rdx is the new HP value. Confirm it's a damage event (HP decrease).
-    const int32_t currentHp = *reinterpret_cast<int32_t*>(localStatModule + 0x138);
-    const int32_t newHp     = rdx;
-    int32_t pendingRawDamage = 0;
-    const bool hasPendingRaw = TryConsumePendingRawDamage(localStatModule, &pendingRawDamage);
+    if (!localPlayerResolved || !localStatModule)
+    {
+        SharedDamageBossDiagTryLogDrainApply(
+            pending,
+            false,
+            "local-player-unresolved",
+            damage,
+            -1,
+            -1);
+        return;
+    }
 
-    if (hasPendingRaw && currentHp > 0 && newHp < currentHp)
-    {
-        ModUtils::Log("SharedDamage: Hook fired: using pending raw damage=%d (hp %d -> %d)",
-                      pendingRawDamage, currentHp, newHp);
-        fpDamageFunc(rcx, rdx);
-        BroadcastDamage(pendingRawDamage);
-    }
-    else if (currentHp > 0 && newHp < currentHp)
-    {
-        // Fallback path: game writes currentHp - rawDamage directly, even when negative
-        // (no sentinelization observed at the HP-write level). currentHp - newHp gives
-        // the correct raw damage for both normal hits (newHp >= 0) and lethal overkill
-        // (newHp < 0 because rawDamage > currentHp).
-        // Guard: currentHp > 0 excludes post-death writes where currentHp is already 0;
-        // those satisfy newHp < currentHp but must not generate additional packets.
-        const int32_t damage = currentHp - newHp;
-        ModUtils::Log("SharedDamage: Hook fired: %s damage=%d (hp %d -> %d)",
-                      newHp < 0 ? "lethal" : "normal", damage, currentHp, newHp);
-        fpDamageFunc(rcx, rdx);
-        BroadcastDamage(damage);
-    }
-    else
-    {
-        // Either newHp >= currentHp (heal/restore) or currentHp == 0 (post-death write).
-        if (hasPendingRaw)
-        {
-            ModUtils::Log("SharedDamage: Hook fired: pending raw damage=%d ignored because write was not a damage event (hp %d -> %d)",
-                          pendingRawDamage, currentHp, newHp);
-        }
-        fpDamageFunc(rcx, rdx);
-    }
+    ApplyDamageToLocalPlayer(localStatModule, damage, pending);
 }
 
-// AoB scanner that returns 0 silently on failure instead of calling MessageBox.
-// ModUtils::AobScan pops an MB_SYSTEMMODAL MessageBox when the pattern isn't
-// found, which blocks the retry loop and requires the user to click OK each
-// attempt. This replicates the same scan logic without the popup.
-//
-// Scans committed, readable memory regions starting from the eldenring.exe
-// module base. Protection checks mirror ModUtils exactly so the same byte
-// ranges are covered.
-// startFrom: if non-zero, skip all bytes before this address. Used to iterate
-// over multiple matches in the same pattern by passing prevMatch + 1 each time.
-static uintptr_t SilentAobScan(const char* pattern, uintptr_t startFrom = 0)
+static void __fastcall hkHpDelta7(
+    uintptr_t statModule, int32_t deltaHp, uint8_t flagA, uint8_t flagB,
+    float arg5, float arg6, uint8_t flagC)
 {
-    // Tokenize: space-separated, "?" is wildcard (ModUtils convention).
-    std::vector<std::string> tokens;
+    const uintptr_t local =
+        g_cachedLocalStatModule.load(memory_order_acquire);
+    const bool modulesMatch = local != 0 && statModule == local;
+    const uintptr_t callerAddress =
+        reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const uintptr_t moduleBase = GetGameModuleBase();
+    const uintptr_t callerRva =
+        moduleBase && callerAddress >= moduleBase
+            ? callerAddress - moduleBase
+            : 0;
+
+    uint32_t captureSeq = 0;
+    bool captureRan = false;
+    if (deltaHp < 0)
     {
-        std::istringstream iss(pattern);
-        std::string tok;
-        while (iss >> tok)
-            tokens.push_back(tok);
+        captureSeq = TryCapturePendingRawDamage(
+            statModule, deltaHp, PendingDamageSource::HpDelta7);
+        captureRan = captureSeq != 0;
     }
-    if (tokens.empty()) return 0;
 
-    const size_t len = tokens.size();
+    SharedDamageBossDiagTryLogDelta7Entry(
+        statModule,
+        local,
+        deltaHp,
+        modulesMatch,
+        callerRva,
+        captureRan,
+        captureSeq);
 
-    // Try the named module first; fall back to GetModuleHandleA(nullptr) (always
-    // returns the EXE base) in case me3 hasn't registered "eldenring.exe" yet.
-    uintptr_t moduleBase = reinterpret_cast<uintptr_t>(GetModuleHandleA("eldenring.exe"));
-    if (!moduleBase)
+    if (deltaHp < 0)
     {
-        OutputDebugStringA("[SharedDamage] GetModuleHandleA(eldenring.exe) returned NULL, falling back to GetModuleHandleA(nullptr)\n");
-        moduleBase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
-    }
-    if (!moduleBase) return 0;
-
-    // Constrain scan to eldenring.exe's image only — avoids scanning 1600+ regions
-    // of system DLLs, which are irrelevant and dramatically slow down each attempt.
-    MODULEINFO modInfo{};
-    GetModuleInformation(GetCurrentProcess(), reinterpret_cast<HMODULE>(moduleBase),
-                         &modInfo, sizeof(modInfo));
-    const uintptr_t scanEnd = moduleBase + modInfo.SizeOfImage;
-
-    // Start from the later of the module base or the caller's resume address.
-    uintptr_t regionAddr = (startFrom > moduleBase) ? startFrom : moduleBase;
-
-    MEMORY_BASIC_INFORMATION mbi{};
-    while (VirtualQuery(reinterpret_cast<void*>(regionAddr), &mbi, sizeof(mbi)) == sizeof(mbi))
-    {
-        // Stop once we've passed the end of the module image.
-        if (reinterpret_cast<uintptr_t>(mbi.BaseAddress) >= scanEnd)
-            break;
-        const bool readable =
-            mbi.State == MEM_COMMIT &&
-            (mbi.Protect == PAGE_EXECUTE_READWRITE ||
-             mbi.Protect == PAGE_READWRITE         ||
-             mbi.Protect == PAGE_READONLY          ||
-             mbi.Protect == PAGE_WRITECOPY         ||
-             mbi.Protect == PAGE_EXECUTE_WRITECOPY ||
-             mbi.Protect == PAGE_EXECUTE_READ);
-
-        if (readable)
+        if (modulesMatch)
         {
-            const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-            const uintptr_t end  = base + mbi.RegionSize;
-            // Within the first region, honor startFrom so we don't re-find the
-            // previous match. In subsequent regions base >= startFrom already.
-            const uintptr_t scanStart = (startFrom > base) ? startFrom : base;
-
-            for (uintptr_t cur = scanStart; cur + len <= end; ++cur)
-            {
-                bool match = true;
-                for (size_t i = 0; i < len; ++i)
-                {
-                    if (tokens[i] == "?") continue;
-                    if (*reinterpret_cast<const uint8_t*>(cur + i) !=
-                        static_cast<uint8_t>(std::stoul(tokens[i], nullptr, 16)))
-                    {
-                        match = false;
-                        break;
-                    }
-                }
-                if (match) return cur;
-            }
+            SharedDamageBossDiagTryLogDeltaLocal(
+                captureSeq,
+                statModule,
+                local,
+                deltaHp,
+                callerRva,
+                "hp-delta-7",
+                captureRan);
         }
-
-        regionAddr = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        else
+        {
+            SharedDamageBossDiagTryLogDeltaNonLocal(
+                statModule, local, deltaHp, callerRva);
+        }
     }
 
-    return 0; // not found — no popup
+    fpHpDelta7(statModule, deltaHp, flagA, flagB, arg5, arg6, flagC);
 }
 
-// Phase 1: Spin until the AoB for the WorldChrManImp RIP-relative MOV is found
-//          (i.e. Arxan has decrypted that region of .text).
-// Phase 2: Spin until the object pointer itself is non-null (i.e. the game has
-//          constructed the WorldChrManImp singleton and written it to .data).
-// These are two separate waits: the static pointer address is fixed at link time,
-// but the object it points to is created at game startup and may arrive late.
-// Returns the address of the static pointer variable (not the object address).
-static uintptr_t WaitForWorldChrMan()
+static void __fastcall hkHpDelta8(
+    uintptr_t statModule, int32_t deltaHp, uint8_t flagA, uint8_t flagB,
+    uint8_t flagC, float arg6, float arg7, uint8_t flagD)
 {
-    OutputDebugStringA("[SharedDamage] WaitForWorldChrMan entered\n");
+    const uintptr_t local =
+        g_cachedLocalStatModule.load(memory_order_acquire);
+    const bool modulesMatch = local != 0 && statModule == local;
+    const uintptr_t callerAddress =
+        reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const uintptr_t moduleBase = GetGameModuleBase();
+    const uintptr_t callerRva =
+        moduleBase && callerAddress >= moduleBase
+            ? callerAddress - moduleBase
+            : 0;
 
-    // --- Phase 1: find the static pointer address via AoB ---
-    uintptr_t ptrAddr = 0;
-    for (int attempt = 1; ; ++attempt)
+    uint32_t captureSeq = 0;
+    bool captureRan = false;
+    if (deltaHp < 0)
     {
-        // Try primary (MOV RAX, [rip+x]) then fallback (MOV RSI, [rip+x]).
-        uintptr_t scan = SilentAobScan(WORLD_CHR_MAN_PATTERN);
-        const char* patternUsed = "primary";
-        if (!scan)
-        {
-            scan = SilentAobScan(WORLD_CHR_MAN_PATTERN_FALLBACK);
-            patternUsed = "fallback";
-        }
-        if (scan)
-        {
-            // 48 8B 05/35 [rip+off32] — offset at +3, instruction size 7.
-            ptrAddr = ModUtils::RelativeToAbsoluteAddress(scan + 3);
-            char dbgMsg[192];
-            sprintf_s(dbgMsg,
-                      "[SharedDamage] WorldChrManImp static ptr at %p (via %s pattern, attempt %d)\n",
-                      reinterpret_cast<void*>(ptrAddr), patternUsed, attempt);
-            OutputDebugStringA(dbgMsg);
-            ModUtils::Log("SharedDamage: WorldChrManImp static ptr at %p (via %s pattern, attempt %d)",
-                          (void*)ptrAddr, patternUsed, attempt);
-            break;
-        }
-        char dbgMsg[128];
-        sprintf_s(dbgMsg, "[SharedDamage] WaitForWorldChrMan scan attempt %d\n", attempt);
-        OutputDebugStringA(dbgMsg);
-        ModUtils::Log("SharedDamage: WorldChrManImp not found (attempt %d), retrying in 2s...", attempt);
-        Sleep(2000);
+        captureSeq = TryCapturePendingRawDamage(
+            statModule, deltaHp, PendingDamageSource::HpDelta8);
+        captureRan = captureSeq != 0;
     }
 
-    // --- Phase 2: wait for the game to populate the pointer with an object ---
-    // The static pointer is valid but may still be null until the game constructs
-    // the singleton. Cap at 60 attempts (2 minutes) to avoid hanging forever.
-    for (int attempt = 1; attempt <= 60; ++attempt)
+    SharedDamageBossDiagTryLogDelta8Entry(
+        statModule,
+        local,
+        deltaHp,
+        modulesMatch,
+        callerRva,
+        captureRan,
+        captureSeq);
+
+    if (deltaHp < 0)
     {
-        const uintptr_t value = *reinterpret_cast<uintptr_t*>(ptrAddr);
-        char dbgMsg[192];
-        sprintf_s(dbgMsg,
-                  "[SharedDamage] Waiting for WorldChrManImp object... ptr=%p value=%p (attempt %d)\n",
-                  reinterpret_cast<void*>(ptrAddr), reinterpret_cast<void*>(value), attempt);
-        OutputDebugStringA(dbgMsg);
-        ModUtils::Log("SharedDamage: Waiting for WorldChrManImp object... ptr=%p value=%p (attempt %d)",
-                      (void*)ptrAddr, (void*)value, attempt);
-        if (value)
+        if (modulesMatch)
         {
-            OutputDebugStringA("[SharedDamage] WorldChrManImp object populated\n");
-            ModUtils::Log("SharedDamage: WorldChrManImp object populated at %p", (void*)value);
-            return ptrAddr;
+            SharedDamageBossDiagTryLogDeltaLocal(
+                captureSeq,
+                statModule,
+                local,
+                deltaHp,
+                callerRva,
+                "hp-delta-8",
+                captureRan);
         }
-        Sleep(2000);
+        else
+        {
+            SharedDamageBossDiagTryLogDeltaNonLocal(
+                statModule, local, deltaHp, callerRva);
+        }
     }
 
-    // Gave up waiting — return ptrAddr anyway so the caller can log which chain
-    // stage is null (ReadLocalPlayerHp will catch it at wcm == 0).
-    OutputDebugStringA("[SharedDamage] WorldChrManImp object never populated after 120s\n");
-    ModUtils::Log("SharedDamage: WorldChrManImp object never populated after 120s — giving up.");
-    return ptrAddr;
+    fpHpDelta8(
+        statModule, deltaHp, flagA, flagB, flagC, arg6, arg7, flagD);
 }
 
-// --- Remote damage queue ---
-// EnqueueRemoteDamage is called from the poll thread (ModThread).
-// DrainRemoteDamage is called from two game-thread hooks:
-//   1. hkDamageFunc — fires on any local HP write (fast path)
-//   2. hkRunCallbacks — fires every time ersc/game calls SteamAPI_RunCallbacks
-//      (reliable fallback that fires even when the local player is idle)
-// Both drain points ensure fpDamageFunc is never called from ModThread.
-
-static std::mutex           g_damageMutex;
-static std::vector<int32_t> g_damagePending;
-
-void EnqueueRemoteDamage(int32_t damage)
+static void __fastcall hkDamageFunc(uintptr_t statModule, int32_t newHp)
 {
-    std::lock_guard<std::mutex> lk(g_damageMutex);
-    g_damagePending.push_back(damage);
-}
-
-static void DrainRemoteDamage()
-{
-    std::vector<int32_t> pending;
+    const uintptr_t callerAddress =
+        reinterpret_cast<uintptr_t>(_ReturnAddress());
+    if (!g_runCallbacksHookInstalled.load(memory_order_acquire))
     {
-        std::lock_guard<std::mutex> lk(g_damageMutex);
-        pending.swap(g_damagePending);
+        const SharedDamageWorldSnapshot snapshot =
+            CaptureProductionWorldSnapshot();
+        const ProductionSnapshotUpdateResult update =
+            PublishProductionSnapshot(snapshot, true);
+        TryLogUnifiedProductionSnapshot(
+            snapshot,
+            update,
+            0,
+            "hp-write-fallback");
+        DrainRemoteDamageFromSnapshot(
+            snapshot.localStatModule,
+            snapshot.localPlayerResolved,
+            snapshot.presence);
     }
-    for (const int32_t d : pending)
-        ApplyDamageToLocalPlayer(d);
-}
 
-// Second drain point: hook SteamAPI_RunCallbacks so DrainRemoteDamage fires
-// on the game/ersc thread every callback cycle, not just on HP-write events.
-typedef void (*RunCallbacks_t)();
-static RunCallbacks_t fpRunCallbacks = nullptr;
+    const uintptr_t local =
+        g_cachedLocalStatModule.load(memory_order_acquire);
+    if (!local || statModule != local)
+    {
+        fpDamageFunc(statModule, newHp);
+        return;
+    }
+
+    const int32_t currentHp =
+        *reinterpret_cast<int32_t*>(local + 0x138);
+    int32_t rawDamage = 0;
+    BossPendingConsumeDiag consumeDiag{};
+    const bool hasRawDamage =
+        TryConsumePendingRawDamage(local, rawDamage, &consumeDiag);
+
+    fpDamageFunc(statModule, newHp);
+
+    const bool finalDecrease = currentHp > 0 && newHp < currentHp;
+    const bool sameWorldActive = IsSameWorldActive();
+
+    if (finalDecrease)
+    {
+        const char* decision = "no-provenance";
+        if (hasRawDamage && rawDamage > 0 && sameWorldActive)
+            decision = "broadcast";
+        else if (hasRawDamage && rawDamage > 0)
+            decision = "same-world-inactive";
+
+        int matchingNetPlayerSlot = -1;
+        uintptr_t callerRva = 0;
+        if (SharedDamageBossDiagCanLogHpDecrease())
+        {
+            SharedDamageBossNetPlayersSnapshot diagSnapshot =
+                g_lastProductionSnapshot.netPlayersSnapshot;
+            SharedDamageSameWorldProbeResult diagProbe{};
+            diagProbe.snapshot = diagSnapshot;
+            PopulateSlotDiagnosticFields(diagProbe);
+            matchingNetPlayerSlot =
+                FindMatchingStatModuleSlot(diagProbe.snapshot, statModule);
+            const uintptr_t moduleBase = GetGameModuleBase();
+            callerRva = moduleBase && callerAddress >= moduleBase
+                ? callerAddress - moduleBase
+                : 0;
+        }
+
+        SharedDamageBossDiagTryLogHpDecrease(
+            statModule,
+            local,
+            local,
+            matchingNetPlayerSlot,
+            callerRva,
+            currentHp,
+            newHp,
+            hasRawDamage,
+            rawDamage,
+            consumeDiag.pendingSeq,
+            consumeDiag.pendingAgeMs,
+            consumeDiag.result,
+            PendingSourceToString(consumeDiag.pendingSource),
+            decision);
+    }
+
+    if (hasRawDamage && rawDamage > 0 && finalDecrease && sameWorldActive)
+    {
+        BroadcastDamage(rawDamage);
+        if (!g_runCallbacksHookInstalled.load(memory_order_acquire))
+            FlushBroadcastDamage();
+    }
+}
 
 static void hkRunCallbacks()
 {
+    const uint64_t callbackInvocationCount =
+        SharedDamageBossDiagNotifyCallbackInvocation();
     fpRunCallbacks();
 
-    // Log each unique calling thread ID once. A set ensures no caller is
-    // missed regardless of interleaving. Compare against g_gameThreadId
-    // (captured from hkDamageFunc) — that's the authoritative game thread.
+    const SharedDamageWorldSnapshot snapshot =
+        CaptureProductionWorldSnapshot();
+    const ProductionSnapshotUpdateResult update =
+        PublishProductionSnapshot(snapshot, true);
+    TryLogUnifiedProductionSnapshot(
+        snapshot,
+        update,
+        callbackInvocationCount,
+        "steam-callback");
+
+    const ULONGLONG now = GetTickCount64();
+    ULONGLONG nextProbe =
+        g_nextWorldProbeTickMs.load(memory_order_relaxed);
+    if (now >= nextProbe &&
+        g_nextWorldProbeTickMs.compare_exchange_strong(
+            nextProbe, now + 1000, memory_order_relaxed, memory_order_relaxed))
     {
-        static std::mutex  s_seenMutex;
-        static std::set<DWORD> s_seenThreads;
-        const DWORD tid      = GetCurrentThreadId();
-        const DWORD gameTid  = g_gameThreadId.load(std::memory_order_relaxed);
-        bool isNew = false;
+        SharedDamageSameWorldProbeResult productionProbe{};
+        productionProbe.snapshot = snapshot.netPlayersSnapshot;
+        productionProbe.active =
+            snapshot.presence == SharedWorldPresence::RemotePlayersPresent;
+        PopulateSlotDiagnosticFields(productionProbe);
+
+        SharedDamageWorldChrManCandidateProbe primaryProbe{};
+        primaryProbe.pointerAddress = g_diagPrimaryWorldChrManPtrAddr;
+        primaryProbe.probe = ProbeWorldChrManCandidate(primaryProbe.pointerAddress);
+        PopulateSlotDiagnosticFields(primaryProbe.probe);
+
+        SharedDamageWorldChrManCandidateProbe fallbackProbe{};
+        fallbackProbe.pointerAddress = g_diagFallbackWorldChrManPtrAddr;
+        fallbackProbe.probe =
+            ProbeWorldChrManCandidate(fallbackProbe.pointerAddress);
+        PopulateSlotDiagnosticFields(fallbackProbe.probe);
+
+        const int matchingSlot = FindMatchingStatModuleSlot(
+            productionProbe.snapshot, snapshot.localStatModule);
+        ++g_worldProbeSampleCount;
+        const bool layoutChanged =
+            !g_havePreviousWorldProbe ||
+            WorldProbeLayoutChanged(g_previousWorldProbe, productionProbe);
+        const bool periodicSample =
+            g_worldProbeSampleCount <= 2 ||
+            (g_worldProbeSampleCount % 10) == 0;
+        if (layoutChanged || periodicSample)
         {
-            std::lock_guard<std::mutex> lk(s_seenMutex);
-            isNew = s_seenThreads.insert(tid).second;
+            const bool candidatesAlias =
+                g_diagPrimaryWorldChrManPtrAddr != 0 &&
+                g_diagPrimaryWorldChrManPtrAddr ==
+                    g_diagFallbackWorldChrManPtrAddr;
+            SharedDamageBossDiagTryLogWorldProbe(
+                snapshot.worldChrManPointerAddress,
+                productionProbe,
+                primaryProbe,
+                fallbackProbe,
+                candidatesAlias,
+                snapshot.localStatModule,
+                matchingSlot,
+                callbackInvocationCount);
         }
-        if (isNew)
-        {
-            char dbg[160];
-            sprintf_s(dbg,
-                      "[SharedDamage] hkRunCallbacks: tid=%lu gameTid=%lu isGameThread=%d\n",
-                      tid, gameTid, (gameTid && tid == gameTid) ? 1 : 0);
-            OutputDebugStringA(dbg);
-            ModUtils::Log("SharedDamage: hkRunCallbacks: tid=%lu gameTid=%lu isGameThread=%d",
-                          tid, gameTid, (gameTid && tid == gameTid) ? 1 : 0);
-        }
+        g_previousWorldProbe = productionProbe;
+        g_havePreviousWorldProbe = true;
+        LogSharedDamageSteamStateIfChanged(callbackInvocationCount);
     }
 
-    DrainRemoteDamage();
+    FlushBroadcastDamage();
+    DrainRemoteDamageFromSnapshot(
+        snapshot.localStatModule,
+        snapshot.localPlayerResolved,
+        snapshot.presence);
+}
 }
 
-// Apply a received damage amount to the local player via the hooked write path.
-void ApplyDamageToLocalPlayer(int32_t damage)
+uintptr_t* g_worldChrManPtr = nullptr;
+DamageFunc_t fpDamageFunc = nullptr;
+
+bool IsSameWorldActive()
 {
-    const uintptr_t statModule = GetLocalPlayerStatModule();
-    if (!statModule)
+    return g_sameWorldActive.load(memory_order_acquire);
+}
+
+void DrainRemoteDamage(
+    uintptr_t localStatModule,
+    bool localPlayerResolved,
+    SharedWorldPresence presence)
+{
+    DrainRemoteDamageFromSnapshot(
+        localStatModule, localPlayerResolved, presence);
+}
+
+void EnqueueRemoteDamage(int32_t damage)
+{
+    if (damage <= 0)
     {
-        OutputDebugStringA("[SharedDamage] ApplyDamageToLocalPlayer: statModule null — skipping\n");
-        ModUtils::Log("SharedDamage: ApplyDamageToLocalPlayer: statModule null — skipping");
+        SharedDamageBossDiagTryLogEnqueue(
+            damage, false, "nonpositive-damage", 0);
         return;
     }
-    const int32_t currentHp = *reinterpret_cast<int32_t*>(statModule + 0x138);
-    const int32_t newHp     = std::max(0, currentHp - damage);
-    char dbg[128];
-    sprintf_s(dbg, "[SharedDamage] ApplyDamageToLocalPlayer: damage=%d hp=%d -> %d\n",
-              damage, currentHp, newHp);
-    OutputDebugStringA(dbg);
-    ModUtils::Log("SharedDamage: ApplyDamageToLocalPlayer: damage=%d hp=%d -> %d",
-                  damage, currentHp, newHp);
+
+    if (!IsSameWorldActive())
+    {
+        SharedDamageBossDiagTryLogEnqueue(
+            damage, false, "same-world-inactive", 0);
+        return;
+    }
+
+    const int64_t pendingTotal =
+        g_damagePendingTotal.fetch_add(damage, memory_order_release) + damage;
+    SharedDamageBossDiagTryLogEnqueue(
+        damage, true, "accepted", pendingTotal);
+}
+
+void ApplyDamageToLocalPlayer(
+    uintptr_t statModule, int32_t damage, int64_t pendingAmount)
+{
+    if (damage <= 0)
+    {
+        SharedDamageBossDiagTryLogDrainApply(
+            pendingAmount,
+            false,
+            "nonpositive-damage",
+            damage,
+            -1,
+            -1);
+        return;
+    }
+
+    if (!fpDamageFunc)
+    {
+        SharedDamageBossDiagTryLogDrainApply(
+            pendingAmount,
+            false,
+            "hp-write-hook-missing",
+            damage,
+            -1,
+            -1);
+        return;
+    }
+
+    if (!statModule)
+    {
+        SharedDamageBossDiagTryLogDrainApply(
+            pendingAmount,
+            false,
+            "local-player-unresolved",
+            damage,
+            -1,
+            -1);
+        return;
+    }
+
+    const int32_t currentHp =
+        *reinterpret_cast<int32_t*>(statModule + 0x138);
+    const int32_t newHp = max(0, currentHp - damage);
     fpDamageFunc(statModule, newHp);
+    SharedDamageBossDiagTryLogDrainApply(
+        pendingAmount,
+        true,
+        "applied",
+        damage,
+        currentHp,
+        newHp);
 }
 
 void InitHooks()
 {
-    OutputDebugStringA("[SharedDamage] InitHooks entered\n");
-    // --- Wait for Arxan to finish decrypting before scanning ---
-    g_worldChrManPtr = reinterpret_cast<uintptr_t*>(WaitForWorldChrMan());
+    bool hpWriteHookEnabled = false;
+    bool hpDelta7HookEnabled = false;
+    bool hpDelta8HookEnabled = false;
+    bool callbacksHookEnabled = false;
+    bool sharingReady = false;
+    SharedDamageHookInstallDiag installDiag{};
+    installDiag.moduleBase = GetGameModuleBase();
 
-    // --- Startup pointer-chain sanity check ---
-    // Sleep briefly to give the game time to populate the player array, then
-    // read local HP once. A -1 means an offset in the chain is wrong even before
-    // any damage occurs; a plausible value (> 0) confirms the chain is correct.
-    OutputDebugStringA("[SharedDamage] Waiting 5s for player array to populate...\n");
-    ModUtils::Log("SharedDamage: Waiting 5s for player array to populate...");
-    Sleep(5000);
+    installDiag.primaryWorldChrMan =
+        ResolveWorldChrManCandidate(WORLD_CHR_MAN_PATTERN);
+    installDiag.fallbackWorldChrMan =
+        ResolveWorldChrManCandidate(WORLD_CHR_MAN_PATTERN_FALLBACK);
+    g_diagPrimaryWorldChrManPtrAddr =
+        installDiag.primaryWorldChrMan.pointerAddress;
+    g_diagFallbackWorldChrManPtrAddr =
+        installDiag.fallbackWorldChrMan.pointerAddress;
+
+    if (installDiag.fallbackWorldChrMan.pointerAddress != 0)
     {
-        const int32_t startupHp = ReadLocalPlayerHp();
-        char dbg[128];
-        sprintf_s(dbg, "[SharedDamage] Startup check: local player HP = %d\n", startupHp);
-        OutputDebugStringA(dbg);
-        ModUtils::Log("SharedDamage: Startup check: local player HP = %d", startupHp);
-    }
-
-    // --- Locate the damage function entry point ---
-    //
-    // Path A (preferred): scan directly for the confirmed prologue bytes.
-    //   No backward walk needed — the match IS the function start.
-    //
-    // Path B (fallback): scan for a mid-function instruction and use
-    //   FindFunctionStart to walk backward to the prologue. Applied only if
-    //   the prologue pattern fails (e.g. after a game update changes the prolog).
-    uintptr_t funcStart = 0;
-
-    // --- Path A: direct prologue scan ---
-    funcStart = SilentAobScan(DAMAGE_FUNC_PROLOGUE);
-    if (funcStart)
-    {
-        char dbg[128];
-        sprintf_s(dbg, "[SharedDamage] Damage function prologue found directly at %p\n",
-                  reinterpret_cast<void*>(funcStart));
-        OutputDebugStringA(dbg);
-        ModUtils::Log("SharedDamage: Damage function prologue found directly at %p",
-                      (void*)funcStart);
-
-        // Verify the pattern is unique — a common prologue sequence may match
-        // dozens of functions and we could be hooking the wrong one.
-        int matchCount = 1;
-        uintptr_t searchFrom = funcStart + 1;
-        for (;;)
+        g_worldChrManPtr = reinterpret_cast<uintptr_t*>(
+            installDiag.fallbackWorldChrMan.pointerAddress);
+        for (int attempt = 0; attempt < 600; ++attempt)
         {
-            const uintptr_t next = SilentAobScan(DAMAGE_FUNC_PROLOGUE, searchFrom);
-            if (!next) break;
-            matchCount++;
-            char warn[128];
-            sprintf_s(warn,
-                      "[SharedDamage] WARNING: prologue pattern not unique — match #%d at %p\n",
-                      matchCount, reinterpret_cast<void*>(next));
-            OutputDebugStringA(warn);
-            ModUtils::Log("SharedDamage: WARNING: prologue pattern not unique — match #%d at %p",
-                          matchCount, (void*)next);
-            searchFrom = next + 1;
+            if (*g_worldChrManPtr)
+                break;
+            Sleep(100);
         }
-        char summary[128];
-        sprintf_s(summary, "[SharedDamage] Prologue pattern total matches: %d\n", matchCount);
-        OutputDebugStringA(summary);
-        ModUtils::Log("SharedDamage: Prologue pattern total matches: %d", matchCount);
-    }
-
-    // --- Path B: mid-instruction scan + backward prologue walk ---
-    if (!funcStart)
-    {
-        OutputDebugStringA("[SharedDamage] Prologue pattern not found, trying mid-instruction fallback\n");
-        ModUtils::Log("SharedDamage: Prologue pattern not found, trying mid-instruction fallback");
-
-        struct { const char* pattern; const char* name; } damagePatterns[] = {
-            { DAMAGE_PATTERN_LATE,  "late (1.10+)"    },
-            { DAMAGE_PATTERN_EARLY, "early (pre-1.10)" },
-        };
-
-        uintptr_t midAddr   = 0;
-        const char* patternUsed = nullptr;
-
-        for (auto& dp : damagePatterns)
-        {
-            uintptr_t searchFrom = 0;
-            for (;;)
-            {
-                const uintptr_t candidate = SilentAobScan(dp.pattern, searchFrom);
-                if (!candidate) break;
-
-                const uintptr_t prologue = FindFunctionStart(candidate);
-                const size_t    offset   = prologue ? (candidate - prologue) : SIZE_MAX;
-
-                if (prologue)
-                {
-                    const uint8_t b0 = *reinterpret_cast<const uint8_t*>(prologue);
-                    const uint8_t b1 = *reinterpret_cast<const uint8_t*>(prologue + 1);
-                    const uint8_t b2 = *reinterpret_cast<const uint8_t*>(prologue + 2);
-                    char dbgBytes[128];
-                    sprintf_s(dbgBytes,
-                              "[SharedDamage] prologue bytes at %p: %02x %02x %02x\n",
-                              reinterpret_cast<void*>(prologue), b0, b1, b2);
-                    OutputDebugStringA(dbgBytes);
-                    ModUtils::Log("SharedDamage: prologue bytes at %p: %02x %02x %02x",
-                                  (void*)prologue, b0, b1, b2);
-                }
-
-                bool accepted = prologue && offset < 0x400;
-                if (accepted && !LooksLikeProlog(prologue))
-                {
-                    char dbgFail[128];
-                    sprintf_s(dbgFail,
-                              "[SharedDamage] prologue at %p fails LooksLikeProlog — rejected\n",
-                              reinterpret_cast<void*>(prologue));
-                    OutputDebugStringA(dbgFail);
-                    ModUtils::Log("SharedDamage: prologue at %p fails LooksLikeProlog — rejected",
-                                  (void*)prologue);
-                    accepted = false;
-                }
-
-                char dbg[256];
-                sprintf_s(dbg,
-                          "[SharedDamage] Damage pattern candidate at %p, prologue offset %zu — %s\n",
-                          reinterpret_cast<void*>(candidate), offset, accepted ? "accepted" : "rejected");
-                OutputDebugStringA(dbg);
-                ModUtils::Log("SharedDamage: Damage pattern candidate at %p, prologue offset %zu — %s",
-                              (void*)candidate, offset, accepted ? "accepted" : "rejected");
-
-                if (accepted)
-                {
-                    midAddr     = candidate;
-                    funcStart   = prologue;
-                    patternUsed = dp.name;
-                    break;
-                }
-                searchFrom = candidate + 1;
-            }
-            if (midAddr) break;
-        }
-
-        if (funcStart)
-        {
-            char dbg[192];
-            sprintf_s(dbg, "[SharedDamage] Damage function found via %s pattern at %p\n",
-                      patternUsed, reinterpret_cast<void*>(funcStart));
-            OutputDebugStringA(dbg);
-            ModUtils::Log("SharedDamage: Damage function found via %s pattern at %p",
-                          patternUsed, (void*)funcStart);
-        }
-    }
-
-    if (!funcStart)
-    {
-        ModUtils::Log("SharedDamage: Damage function not found — update patterns for this game version.");
-        OutputDebugStringA("[SharedDamage] Damage function not found\n");
-        return;
-    }
-
-    // --- Install hooks ---
-    // --- Locate the generic HP-delta wrapper ---
-    // This path sees a signed delta before the final HP write clamps/sentinelizes
-    // lethal hits. We capture the raw incoming damage here and consume it from
-    // hkDamageFunc once the write is confirmed.
-    uintptr_t deltaFuncStart = 0;
-    {
-        const uintptr_t deltaMid = SilentAobScan(HP_DELTA_WRAPPER_PATTERN);
-        if (deltaMid && deltaMid >= HP_DELTA_WRAPPER_BACKTRACK)
-        {
-            deltaFuncStart = deltaMid - HP_DELTA_WRAPPER_BACKTRACK;
-            char dbg[160];
-            sprintf_s(dbg,
-                      "[SharedDamage] HP-delta wrapper found at %p (mid=%p)\n",
-                      reinterpret_cast<void*>(deltaFuncStart),
-                      reinterpret_cast<void*>(deltaMid));
-            OutputDebugStringA(dbg);
-            ModUtils::Log("SharedDamage: HP-delta wrapper found at %p (mid=%p)",
-                          (void*)deltaFuncStart, (void*)deltaMid);
-
-            int matchCount = 1;
-            uintptr_t searchFrom = deltaMid + 1;
-            for (;;)
-            {
-                const uintptr_t next = SilentAobScan(HP_DELTA_WRAPPER_PATTERN, searchFrom);
-                if (!next) break;
-                matchCount++;
-                char warn[160];
-                sprintf_s(warn,
-                          "[SharedDamage] WARNING: HP-delta wrapper pattern not unique â€” match #%d at %p\n",
-                          matchCount, reinterpret_cast<void*>(next));
-                OutputDebugStringA(warn);
-                ModUtils::Log("SharedDamage: WARNING: HP-delta wrapper pattern not unique â€” match #%d at %p",
-                              matchCount, (void*)next);
-                searchFrom = next + 1;
-            }
-            char summary[160];
-            sprintf_s(summary,
-                      "[SharedDamage] HP-delta wrapper pattern total matches: %d\n",
-                      matchCount);
-            OutputDebugStringA(summary);
-            ModUtils::Log("SharedDamage: HP-delta wrapper pattern total matches: %d",
-                          matchCount);
-        }
-        else
-        {
-            OutputDebugStringA("[SharedDamage] HP-delta wrapper pattern not found â€” lethal overkill will fall back to final HP deltas\n");
-            ModUtils::Log("SharedDamage: HP-delta wrapper pattern not found â€” lethal overkill will fall back to final HP deltas");
-        }
-    }
-
-    MH_Initialize();
-
-    // Hook 1: game's HP-write function — primary drain point for remote damage.
-    const MH_STATUS status = MH_CreateHook(
-        reinterpret_cast<void*>(funcStart),
-        reinterpret_cast<void*>(&hkDamageFunc),
-        reinterpret_cast<void**>(&fpDamageFunc)
-    );
-    if (status != MH_OK)
-    {
-        ModUtils::Log("SharedDamage: MH_CreateHook (damage) failed (status %d).", (int)status);
-        return;
-    }
-    ModUtils::Log("SharedDamage: Damage hook installed at %p.", (void*)funcStart);
-
-    // Hook 2: generic HP-delta wrapper — captures raw incoming damage before
-    // lethal writes collapse to a sentinel or to remaining HP.
-    if (deltaFuncStart)
-    {
-        const MH_STATUS deltaStatus = MH_CreateHook(
-            reinterpret_cast<void*>(deltaFuncStart),
-            reinterpret_cast<void*>(&hkDamageDeltaFunc),
-            reinterpret_cast<void**>(&fpDamageDeltaFunc)
-        );
-        if (deltaStatus != MH_OK)
-        {
-            ModUtils::Log("SharedDamage: MH_CreateHook (hp-delta) failed (status %d) — lethal overkill will fall back to final HP deltas.", (int)deltaStatus);
-        }
-        else
-        {
-            ModUtils::Log("SharedDamage: HP-delta hook installed at %p.", (void*)deltaFuncStart);
-        }
-    }
-
-    // Hook 3: SteamAPI_RunCallbacks — reliable game-thread tick for draining
-    // remote damage when the local player is idle and hkDamageFunc never fires.
-    // ersc calls this from the game thread on every frame; our hook piggybacks.
-    const MH_STATUS cbStatus = MH_CreateHookApi(
-        L"steam_api64", "SteamAPI_RunCallbacks",
-        reinterpret_cast<void*>(&hkRunCallbacks),
-        reinterpret_cast<void**>(&fpRunCallbacks)
-    );
-    if (cbStatus != MH_OK)
-    {
-        ModUtils::Log("SharedDamage: MH_CreateHookApi (RunCallbacks) failed (status %d) — remote damage will drain on HP-write only.", (int)cbStatus);
     }
     else
     {
-        ModUtils::Log("SharedDamage: SteamAPI_RunCallbacks hook installed.");
+        g_worldChrManPtr =
+            reinterpret_cast<uintptr_t*>(WaitForWorldChrMan());
+    }
+    installDiag.worldChrManPointerAddress =
+        reinterpret_cast<uintptr_t>(g_worldChrManPtr);
+
+    const SharedDamageWorldSnapshot initSnapshot =
+        CaptureProductionWorldSnapshot();
+    g_lastProductionSnapshot = initSnapshot;
+    InitializeProductionFromSnapshot(
+        initSnapshot, GetSharedDamageLobbyPresence());
+
+    installDiag.damagePatternMatches =
+        CountPatternMatches(DAMAGE_FUNC_PROLOGUE);
+    const uintptr_t damageEntry = ScanUniquePattern(DAMAGE_FUNC_PROLOGUE);
+    installDiag.damagePatternMatch = damageEntry;
+    installDiag.damageEntry = damageEntry;
+    installDiag.damageEntryRva = ToRva(damageEntry);
+    installDiag.damagePrologueValid = ValidateFunctionEntry(
+        damageEntry,
+        HP_WRITE_EXPECTED_RVA,
+        installDiag.damagePdataBeginRva,
+        installDiag.damagePdataEndRva);
+
+    installDiag.hpDelta7Matches =
+        CountPatternMatches(HP_DELTA7_WRAPPER_PATTERN);
+    const uintptr_t hpDelta7Match =
+        ScanUniquePattern(HP_DELTA7_WRAPPER_PATTERN);
+    installDiag.hpDelta7PatternMatch = hpDelta7Match;
+    const uintptr_t hpDelta7Entry =
+        (hpDelta7Match >= HP_DELTA7_WRAPPER_BACKTRACK)
+            ? hpDelta7Match - HP_DELTA7_WRAPPER_BACKTRACK
+            : 0;
+    installDiag.hpDelta7Entry = hpDelta7Entry;
+    installDiag.hpDelta7EntryRva = ToRva(hpDelta7Entry);
+    installDiag.hpDelta7PrologueValid = ValidateFunctionEntry(
+        hpDelta7Entry,
+        HP_DELTA7_EXPECTED_RVA,
+        installDiag.hpDelta7PdataBeginRva,
+        installDiag.hpDelta7PdataEndRva);
+
+    installDiag.hpDelta8Matches =
+        CountPatternMatches(HP_DELTA8_WRAPPER_PATTERN);
+    const uintptr_t hpDelta8Entry =
+        ScanUniquePattern(HP_DELTA8_WRAPPER_PATTERN);
+    installDiag.hpDelta8Entry = hpDelta8Entry;
+    installDiag.hpDelta8EntryRva = ToRva(hpDelta8Entry);
+    installDiag.hpDelta8PrologueValid = ValidateFunctionEntry(
+        hpDelta8Entry,
+        HP_DELTA8_EXPECTED_RVA,
+        installDiag.hpDelta8PdataBeginRva,
+        installDiag.hpDelta8PdataEndRva);
+
+    if (!damageEntry || installDiag.damagePatternMatches != 1 ||
+        !installDiag.damagePrologueValid)
+    {
+        installDiag.failedStage = "hp-write-scan-or-pdata";
+        LogBossDiagStartup(
+            hpWriteHookEnabled,
+            hpDelta7HookEnabled,
+            hpDelta8HookEnabled,
+            callbacksHookEnabled,
+            sharingReady,
+            installDiag,
+            initSnapshot);
+        return;
     }
 
-    MH_EnableHook(MH_ALL_HOOKS);
+    if (!hpDelta7Entry || installDiag.hpDelta7Matches != 1 ||
+        !installDiag.hpDelta7PrologueValid)
+    {
+        installDiag.failedStage = "hp-delta7-scan-or-pdata";
+        LogBossDiagStartup(
+            hpWriteHookEnabled,
+            hpDelta7HookEnabled,
+            hpDelta8HookEnabled,
+            callbacksHookEnabled,
+            sharingReady,
+            installDiag,
+            initSnapshot);
+        return;
+    }
 
-    OutputDebugStringA("[SharedDamage] InitHooks returning\n");
-    ModUtils::Log("SharedDamage: InitHooks returning");
+    if (!hpDelta8Entry || installDiag.hpDelta8Matches != 1 ||
+        !installDiag.hpDelta8PrologueValid)
+    {
+        installDiag.failedStage = "hp-delta8-scan-or-pdata";
+        LogBossDiagStartup(
+            hpWriteHookEnabled,
+            hpDelta7HookEnabled,
+            hpDelta8HookEnabled,
+            callbacksHookEnabled,
+            sharingReady,
+            installDiag,
+            initSnapshot);
+        return;
+    }
+
+    const MH_STATUS initializeStatus = MH_Initialize();
+    installDiag.mhInitializeResult = static_cast<int>(initializeStatus);
+    if (initializeStatus != MH_OK &&
+        initializeStatus != MH_ERROR_ALREADY_INITIALIZED)
+    {
+        installDiag.failedStage = "mh-initialize";
+        LogBossDiagStartup(
+            hpWriteHookEnabled,
+            hpDelta7HookEnabled,
+            hpDelta8HookEnabled,
+            callbacksHookEnabled,
+            sharingReady,
+            installDiag,
+            initSnapshot);
+        return;
+    }
+
+    const MH_STATUS hpWriteCreateStatus = MH_CreateHook(
+        reinterpret_cast<void*>(damageEntry),
+        reinterpret_cast<void*>(&hkDamageFunc),
+        reinterpret_cast<void**>(&fpDamageFunc));
+    installDiag.hpWriteCreateResult = static_cast<int>(hpWriteCreateStatus);
+
+    const MH_STATUS hpDelta7CreateStatus = MH_CreateHook(
+        reinterpret_cast<void*>(hpDelta7Entry),
+        reinterpret_cast<void*>(&hkHpDelta7),
+        reinterpret_cast<void**>(&fpHpDelta7));
+    installDiag.hpDelta7CreateResult = static_cast<int>(hpDelta7CreateStatus);
+
+    const MH_STATUS hpDelta8CreateStatus = MH_CreateHook(
+        reinterpret_cast<void*>(hpDelta8Entry),
+        reinterpret_cast<void*>(&hkHpDelta8),
+        reinterpret_cast<void**>(&fpHpDelta8));
+    installDiag.hpDelta8CreateResult = static_cast<int>(hpDelta8CreateStatus);
+
+    bool callbacksHookCreated = false;
+    const MH_STATUS callbacksCreateStatus = MH_CreateHookApi(
+        L"steam_api64", "SteamAPI_RunCallbacks",
+        reinterpret_cast<void*>(&hkRunCallbacks),
+        reinterpret_cast<void**>(&fpRunCallbacks));
+    installDiag.callbacksCreateResult = static_cast<int>(callbacksCreateStatus);
+    if (callbacksCreateStatus == MH_OK)
+    {
+        callbacksHookCreated = true;
+        g_runCallbacksHookInstalled.store(true, memory_order_release);
+    }
+    else
+    {
+        fpRunCallbacks = nullptr;
+        g_runCallbacksHookInstalled.store(false, memory_order_release);
+    }
+
+    if (hpWriteCreateStatus != MH_OK)
+        installDiag.failedStage = "hp-write-create";
+    else if (hpDelta7CreateStatus != MH_OK)
+        installDiag.failedStage = "hp-delta7-create";
+    else if (hpDelta8CreateStatus != MH_OK)
+        installDiag.failedStage = "hp-delta8-create";
+
+    if (hpWriteCreateStatus != MH_OK || hpDelta7CreateStatus != MH_OK ||
+        hpDelta8CreateStatus != MH_OK)
+    {
+        LogBossDiagStartup(
+            hpWriteHookEnabled,
+            hpDelta7HookEnabled,
+            hpDelta8HookEnabled,
+            callbacksHookEnabled,
+            sharingReady,
+            installDiag,
+            initSnapshot);
+        return;
+    }
+
+    const MH_STATUS enableStatus = MH_EnableHook(MH_ALL_HOOKS);
+    installDiag.enableResult = static_cast<int>(enableStatus);
+    if (enableStatus != MH_OK)
+    {
+        installDiag.failedStage = "mh-enable";
+        installDiag.mhDisableResult =
+            static_cast<int>(MH_DisableHook(MH_ALL_HOOKS));
+        fpDamageFunc = nullptr;
+        fpHpDelta7 = nullptr;
+        fpHpDelta8 = nullptr;
+        fpRunCallbacks = nullptr;
+        g_runCallbacksHookInstalled.store(false, memory_order_release);
+        callbacksHookEnabled = false;
+        LogBossDiagStartup(
+            hpWriteHookEnabled,
+            hpDelta7HookEnabled,
+            hpDelta8HookEnabled,
+            callbacksHookEnabled,
+            sharingReady,
+            installDiag,
+            initSnapshot);
+        return;
+    }
+
+    hpWriteHookEnabled = true;
+    hpDelta7HookEnabled = true;
+    hpDelta8HookEnabled = true;
+    callbacksHookEnabled = callbacksHookCreated;
+    sharingReady = true;
+    const SharedDamageWorldSnapshot postHookSnapshot =
+        CaptureProductionWorldSnapshot();
+    g_lastProductionSnapshot = postHookSnapshot;
+    LogBossDiagStartup(
+        hpWriteHookEnabled,
+        hpDelta7HookEnabled,
+        hpDelta8HookEnabled,
+        callbacksHookEnabled,
+        sharingReady,
+        installDiag,
+        postHookSnapshot);
+    InitializeProductionFromSnapshot(
+        postHookSnapshot, GetSharedDamageLobbyPresence());
 }
 
 void ShutdownHooks()
 {
+    ShutdownSharedDamageBossDiag();
     MH_DisableHook(MH_ALL_HOOKS);
     MH_Uninitialize();
+    g_cachedLocalStatModule.store(0, memory_order_release);
+    g_damagePendingTotal.store(0, memory_order_release);
+    DiscardPendingBroadcastDamage();
+    g_sameWorldActive.store(false, memory_order_release);
+    g_runCallbacksHookInstalled.store(false, memory_order_release);
+    g_nextWorldProbeTickMs.store(0, memory_order_relaxed);
+    g_worldProbeSampleCount = 0;
+    g_havePreviousWorldProbe = false;
+    g_previousWorldProbe = {};
+    g_lastProductionSnapshot = {};
+    g_nextSnapshotSeq.store(0, memory_order_relaxed);
+    g_diagPrimaryWorldChrManPtrAddr = 0;
+    g_diagFallbackWorldChrManPtrAddr = 0;
     g_worldChrManPtr = nullptr;
+    fpDamageFunc = nullptr;
+    fpHpDelta7 = nullptr;
+    fpHpDelta8 = nullptr;
+    fpRunCallbacks = nullptr;
 }

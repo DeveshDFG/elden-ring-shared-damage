@@ -1,27 +1,71 @@
 #include "param_patch.h"
+#include "bullet_sp_effect_allowlist_generated.h"
 
-#define NOMINMAX
-#include <windows.h>
-
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
-#include <fstream>
 
 #include <coresystem/cs_param.hpp>
 #include <param/param.hpp>
 
-#include "ModUtils.h"
+using namespace std;
 
 namespace
 {
-constexpr int32_t SOURCE_SPEFFECT_ID  = 29521;
+constexpr int32_t SOURCE_SPEFFECT_ID = 29521;
 constexpr int32_t RUNTIME_SPEFFECT_ID = 90061;
-
 constexpr int PARAM_WAIT_TIMEOUT_MS = 120000;
 
 constexpr size_t SPEFFECT_LIFECYCLE_FLAGS_OFFSET = 0x352;
 constexpr uint8_t DESTINED_DEATH_HP_MULT_MASK = 0x10;
 constexpr uint8_t HP_BURN_EFFECT_MASK = 0x20;
+
+constexpr array<int32_t, 35> EXCLUDED_ATK_PARAM_NPC_IDS = {
+    280000,
+    280001,
+    2110260,
+    2110270,
+    2110340,
+    2110341,
+    2110350,
+    2110351,
+    2110370,
+    2110400,
+    2110401,
+    2110402,
+    2110403,
+    2110420,
+    2110421,
+    2110460,
+    2110701,
+    2110720,
+    2110730,
+    2110731,
+    2110740,
+    2110741,
+    2110742,
+    2110743,
+    2110750,
+    2110751,
+    8000000,
+    8000001,
+    8000002,
+    8000003,
+    8000004,
+    8000010,
+    8000011,
+    8000015,
+    8000030,
+};
+
+static bool IsExcludedAtkParamNpcRow(int32_t rowId)
+{
+    return binary_search(
+        EXCLUDED_ATK_PARAM_NPC_IDS.begin(),
+        EXCLUDED_ATK_PARAM_NPC_IDS.end(),
+        rowId);
+}
 
 static void SetBit(uint8_t& value, uint8_t mask, bool enabled)
 {
@@ -31,7 +75,8 @@ static void SetBit(uint8_t& value, uint8_t mask, bool enabled)
         value &= static_cast<uint8_t>(~mask);
 }
 
-static void ApplyRuntimeSpEffectOverrides(from::paramdef::SP_EFFECT_PARAM_ST& effect)
+static void ApplyRuntimeSpEffectOverrides(
+    from::paramdef::SP_EFFECT_PARAM_ST& effect)
 {
     effect.iconId = 20460;
     effect.effectEndurance = -1.0f;
@@ -45,136 +90,115 @@ static void ApplyRuntimeSpEffectOverrides(from::paramdef::SP_EFFECT_PARAM_ST& ef
     effect.effectTargetSelfTarget = false;
     effect.eraseOnBonfireRecover = true;
     effect.isContractSpEffectLife = true;
-    effect.isIgnoreNoDamage = true;
+    effect.isIgnoreNoDamage = false;
     effect.spAttributeVariationValue = 1;
 }
 
-static void ApplyRemainingSpEffectBits(from::paramdef::SP_EFFECT_PARAM_ST& effect)
+static void ApplyRemainingSpEffectBits(
+    from::paramdef::SP_EFFECT_PARAM_ST& effect)
 {
     auto* raw = reinterpret_cast<uint8_t*>(&effect);
-    SetBit(*(raw + SPEFFECT_LIFECYCLE_FLAGS_OFFSET), DESTINED_DEATH_HP_MULT_MASK, true);
-    SetBit(*(raw + SPEFFECT_LIFECYCLE_FLAGS_OFFSET), HP_BURN_EFFECT_MASK, true);
+    SetBit(
+        raw[SPEFFECT_LIFECYCLE_FLAGS_OFFSET],
+        DESTINED_DEATH_HP_MULT_MASK,
+        true);
+    SetBit(
+        raw[SPEFFECT_LIFECYCLE_FLAGS_OFFSET],
+        HP_BURN_EFFECT_MASK,
+        true);
 }
 
 static bool PatchSpEffectRow()
 {
-    auto [dstRow, dstExists] = from::param::SpEffectParam[RUNTIME_SPEFFECT_ID];
-    if (!dstExists)
-    {
-        ModUtils::Log("SharedDamage: SpEffectParam row 90061 not found");
+    auto [destination, destinationExists] =
+        from::param::SpEffectParam[RUNTIME_SPEFFECT_ID];
+    if (!destinationExists)
         return false;
-    }
 
-    auto [srcRow, srcExists] = from::param::SpEffectParam[SOURCE_SPEFFECT_ID];
-    if (srcExists)
-    {
-        dstRow = srcRow;
-        ModUtils::Log("SharedDamage: SpEffectParam[90061] cloned from source row 29521 before overrides");
-    }
-    else
-    {
-        dstRow = from::paramdef::SP_EFFECT_PARAM_ST{};
-        ModUtils::Log("SharedDamage: SpEffectParam source row 29521 not found; using libER defaults");
-    }
+    auto [source, sourceExists] =
+        from::param::SpEffectParam[SOURCE_SPEFFECT_ID];
+    destination = sourceExists
+        ? source
+        : from::paramdef::SP_EFFECT_PARAM_ST{};
 
-    ApplyRuntimeSpEffectOverrides(dstRow);
-    ApplyRemainingSpEffectBits(dstRow);
-
-    {
-        char dbg[512];
-        auto* raw = reinterpret_cast<const uint8_t*>(&dstRow);
-        sprintf_s(
-            dbg,
-            "[SharedDamage] SpEffect[90061] final: iconId=%d effectEndurance=%.3f maxHpRate=%.3f spCategory=%u spAttribute=%u wepParamChange=%u vfxId=%d oppose=%d self=%d eraseOnBonfire=%d contract=%d ignoreNoDamage=%d spAttrVar=%u lifecycle=0x%02X\n",
-            dstRow.iconId,
-            dstRow.effectEndurance,
-            dstRow.maxHpRate,
-            static_cast<unsigned>(dstRow.spCategory),
-            static_cast<unsigned>(dstRow.spAttribute),
-            static_cast<unsigned>(dstRow.wepParamChange),
-            dstRow.vfxId,
-            dstRow.effectTargetOpposeTarget ? 1 : 0,
-            dstRow.effectTargetSelfTarget ? 1 : 0,
-            dstRow.eraseOnBonfireRecover ? 1 : 0,
-            dstRow.isContractSpEffectLife ? 1 : 0,
-            dstRow.isIgnoreNoDamage ? 1 : 0,
-            static_cast<unsigned>(dstRow.spAttributeVariationValue),
-            static_cast<unsigned>(raw[SPEFFECT_LIFECYCLE_FLAGS_OFFSET]));
-        OutputDebugStringA(dbg);
-    }
-
-    OutputDebugStringA("[SharedDamage] SpEffectParam[90061] patched successfully via libER\n");
-    ModUtils::Log("SharedDamage: SpEffectParam[90061] patched successfully via libER");
+    ApplyRuntimeSpEffectOverrides(destination);
+    ApplyRemainingSpEffectBits(destination);
     return true;
 }
 
 static bool PatchAtkParamNpc()
 {
-    uint32_t totalRows = 0;
-    uint32_t changedRows = 0;
-
+    uint32_t rows = 0;
     for (auto [rowId, row] : from::param::AtkParam_Npc)
     {
-        ++totalRows;
-        if (row.spEffectId3 == RUNTIME_SPEFFECT_ID)
-            continue;
-
-        row.spEffectId3 = RUNTIME_SPEFFECT_ID;
-        ++changedRows;
-        (void)rowId;
+        ++rows;
+        if (!IsExcludedAtkParamNpcRow(rowId))
+            row.spEffectId3 = RUNTIME_SPEFFECT_ID;
     }
-
-    char dbg[192];
-    sprintf_s(dbg, "[SharedDamage] AtkParam_Npc patched via libER: totalRows=%u changedRows=%u\n",
-              totalRows, changedRows);
-    OutputDebugStringA(dbg);
-    ModUtils::Log("SharedDamage: AtkParam_Npc patched via libER: totalRows=", totalRows,
-                  " changedRows=", changedRows);
-    return totalRows != 0;
-}
+    return rows != 0;
 }
 
-void InitRuntimeParamPatch()
+static bool AtkParamNpcHasHpDamagePotential(
+    const from::paramdef::ATK_PARAM_ST& attack)
 {
-    OutputDebugStringA("[SharedDamage] InitRuntimeParamPatch entered\n");
-    ModUtils::Log("SharedDamage: InitRuntimeParamPatch entered");
+    return attack.atkPhys > 0 ||
+           attack.atkMag > 0 ||
+           attack.atkFire > 0 ||
+           attack.atkThun > 0 ||
+           attack.atkDark > 0 ||
+           attack.atkPhysCorrection > 0 ||
+           attack.atkMagCorrection > 0 ||
+           attack.atkFireCorrection > 0 ||
+           attack.atkThunCorrection > 0 ||
+           attack.atkDarkCorrection > 0;
+}
 
-    OutputDebugStringA("[SharedDamage] Waiting for libER param repository\n");
-    ModUtils::Log("SharedDamage: Waiting for libER param repository");
+static bool BulletRowHasDamagingAttack(
+    const from::paramdef::BULLET_PARAM_ST& bullet)
+{
+    if (bullet.atkId_Bullet <= 0)
+        return false;
 
+    auto [attack, attackExists] =
+        from::param::AtkParam_Npc[bullet.atkId_Bullet];
+    if (!attackExists)
+        return false;
+
+    return AtkParamNpcHasHpDamagePotential(attack);
+}
+
+static bool PatchBulletAllowlist()
+{
+    if (kDestinedDeathBulletAllowlistCount != 6119)
+        return false;
+
+    uint32_t existingRows = 0;
+    for (size_t i = 0; i < kDestinedDeathBulletAllowlistCount; ++i)
+    {
+        auto [row, exists] =
+            from::param::Bullet[kDestinedDeathBulletAllowlist[i]];
+        if (!exists || !BulletRowHasDamagingAttack(row))
+            continue;
+        row.spEffectId3 = RUNTIME_SPEFFECT_ID;
+        ++existingRows;
+    }
+    return existingRows != 0;
+}
+}
+
+void InitDestinedDeathParamPatch()
+{
     if (!from::CS::SoloParamRepository::wait_for_params(PARAM_WAIT_TIMEOUT_MS))
-    {
-        OutputDebugStringA("[SharedDamage] Timed out waiting for libER param repository\n");
-        ModUtils::Log("SharedDamage: Timed out waiting for libER param repository");
         return;
-    }
 
-    auto repository = from::CS::SoloParamRepository::instance();
+    const auto repository =
+        from::CS::SoloParamRepository::instance();
     if (!repository)
-    {
-        OutputDebugStringA("[SharedDamage] libER param repository instance unavailable after wait\n");
-        ModUtils::Log("SharedDamage: libER param repository instance unavailable after wait");
         return;
-    }
 
-    {
-        char dbg[160];
-        sprintf_s(dbg, "[SharedDamage] libER param repository ready at %p\n",
-                  reinterpret_cast<void*>(&repository.reference()));
-        OutputDebugStringA(dbg);
-        ModUtils::Log("SharedDamage: libER param repository ready at ", (void*)&repository.reference());
-    }
-
-    const bool spPatched = PatchSpEffectRow();
-    const bool atkPatched = PatchAtkParamNpc();
-    if (!spPatched || !atkPatched)
-    {
-        OutputDebugStringA("[SharedDamage] Runtime param patch incomplete\n");
-        ModUtils::Log("SharedDamage: Runtime param patch incomplete (spEffectPatched=", spPatched ? 1 : 0,
-                      ", atkPatched=", atkPatched ? 1 : 0, ")");
+    if (!PatchSpEffectRow())
         return;
-    }
 
-    OutputDebugStringA("[SharedDamage] Runtime param patch complete via libER\n");
-    ModUtils::Log("SharedDamage: Runtime param patch complete via libER");
+    PatchBulletAllowlist();
+    PatchAtkParamNpc();
 }

@@ -47,7 +47,6 @@ if(BUILD_SHARED_DAMAGE_MOD)
         src/dllmain.cpp
         src/hooks.cpp
         src/damage.cpp
-        src/shared_damage_boss_diag.cpp
     )
 
     target_include_directories(elden-ring-shared-damage PRIVATE include)

@@ -1,0 +1,29 @@
+{
+    "configurations": [
+        {
+  	    "name": "Win32",
+ 	     "compilerPath": "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.50.35717/bin/Hostx64/x64/cl.exe",
+ 	     "intelliSenseMode": "windows-msvc-x64",
+ 	     "cStandard": "c17",
+ 	     "cppStandard": "c++20",
+		"includePath": [
+		  "${workspaceFolder}/include",
+		  "${workspaceFolder}/libER/libER/include",
+		  "${workspaceFolder}/libER/libER/symbols",
+		  "${workspaceFolder}/build/_deps/inih-src",
+		  "${workspaceFolder}/build/_deps/minhook-src/include",
+		  "C:/Steam/steamworks_sdk/sdk/public"
+		],
+            "defines": [
+                "_DEBUG",
+                "UNICODE",
+                "_UNICODE"
+            ],
+            "windowsSdkVersion": "10.0.26100.0",
+            "cStandard": "c17",
+            "cppStandard": "c++20",
+            "intelliSenseMode": "windows-msvc-x64"
+        }
+    ],
+    "version": 4
+}

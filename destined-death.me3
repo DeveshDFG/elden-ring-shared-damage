@@ -1,7 +1,0 @@
-profileVersion = "v1"
-
-[[supports]]
-game = "eldenring"
-
-[[natives]]
-path = "natives/elden-ring-destined-death.dll"

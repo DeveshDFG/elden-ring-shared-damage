@@ -1,7 +1,6 @@
 #define NOMINMAX
 #include "hooks.h"
 #include "damage.h"
-#include "shared_damage_boss_diag.h"
 
 #include <windows.h>
 #include <psapi.h>
@@ -11,7 +10,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
-#include <intrin.h>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -21,8 +19,20 @@ using namespace std;
 
 namespace
 {
-constexpr const char* WORLD_CHR_MAN_PATTERN =
-    "48 8b 05 ? ? ? ? 48 85 c0 74 0f 48 39 88 ? ? ? ? 75 06 89 b1 5c 03 00 00 0f 28 05 ? ? ? ? 4c 8d 45 e7";
+enum class SharedWorldPresence : uint8_t
+{
+    Unavailable = 0,
+    NoRemotePlayers = 1,
+    RemotePlayersPresent = 2,
+};
+
+struct SharedDamageWorldSnapshot
+{
+    SharedWorldPresence presence = SharedWorldPresence::Unavailable;
+    uintptr_t localStatModule = 0;
+    bool localPlayerResolved = false;
+};
+
 constexpr const char* WORLD_CHR_MAN_PATTERN_FALLBACK =
     "48 8b 35 ? ? ? ? 48 85 f6 ? ? bb 01 00 00 00 89 5c 24 20 48 8b b6";
 constexpr const char* DAMAGE_FUNC_PROLOGUE =
@@ -44,8 +54,6 @@ constexpr uintptr_t NET_PLAYERS_SLOT_STRIDE = 0x10;
 constexpr int NET_PLAYERS_LOCAL_SLOT = 0;
 constexpr int NET_PLAYERS_REMOTE_SLOT_FIRST = 1;
 constexpr int NET_PLAYERS_REMOTE_SLOT_LAST = 5;
-constexpr int NET_PLAYERS_PRODUCTION_SLOT_LAST = 5;
-constexpr int NET_PLAYERS_DIAGNOSTIC_SLOT_LAST = 7;
 constexpr uintptr_t kMinValidUserPointer = 0x10000;
 
 using HpDelta7_t = void(__fastcall*)(
@@ -55,7 +63,10 @@ using HpDelta8_t = void(__fastcall*)(
     uintptr_t statModule, int32_t deltaHp, uint8_t flagA, uint8_t flagB,
     uint8_t flagC, float arg6, float arg7, uint8_t flagD);
 using RunCallbacks_t = void(*)();
+using DamageFunc_t = void(__fastcall*)(uintptr_t statModule, int32_t newHp);
 
+uintptr_t* g_worldChrManPtr = nullptr;
+DamageFunc_t fpDamageFunc = nullptr;
 HpDelta7_t fpHpDelta7 = nullptr;
 HpDelta8_t fpHpDelta8 = nullptr;
 RunCallbacks_t fpRunCallbacks = nullptr;
@@ -63,20 +74,6 @@ atomic<uintptr_t> g_cachedLocalStatModule{0};
 atomic<int64_t> g_damagePendingTotal{0};
 atomic<bool> g_runCallbacksHookInstalled{false};
 atomic<bool> g_sameWorldActive{false};
-atomic<ULONGLONG> g_nextWorldProbeTickMs{0};
-uint64_t g_worldProbeSampleCount = 0;
-bool g_havePreviousWorldProbe = false;
-SharedDamageSameWorldProbeResult g_previousWorldProbe{};
-
-uintptr_t g_diagPrimaryWorldChrManPtrAddr = 0;
-uintptr_t g_diagFallbackWorldChrManPtrAddr = 0;
-
-enum class PendingDamageSource : uint8_t
-{
-    None = 0,
-    HpDelta7 = 1,
-    HpDelta8 = 2,
-};
 
 struct PendingDamageContext
 {
@@ -84,23 +81,10 @@ struct PendingDamageContext
     int32_t rawDamage = 0;
     ULONGLONG tickMs = 0;
     bool active = false;
-    uint32_t captureSeq = 0;
-    PendingDamageSource sourceWrapper = PendingDamageSource::None;
-};
-
-struct BossPendingConsumeDiag
-{
-    uint32_t pendingSeq = 0;
-    uint64_t pendingAgeMs = 0;
-    const char* result = "no-pending";
-    PendingDamageSource pendingSource = PendingDamageSource::None;
 };
 
 thread_local PendingDamageContext g_pendingDamage;
 constexpr ULONGLONG PENDING_DAMAGE_TTL_MS = 250;
-atomic<uint32_t> g_nextCaptureSeq{1};
-SharedDamageWorldSnapshot g_lastProductionSnapshot{};
-atomic<uint32_t> g_nextSnapshotSeq{0};
 
 static uintptr_t GetGameModuleBase()
 {
@@ -193,21 +177,6 @@ static uintptr_t ScanUniquePattern(const char* pattern)
     return ScanPattern(pattern, first + 1) ? 0 : first;
 }
 
-static uint32_t CountPatternMatches(const char* pattern)
-{
-    uint32_t count = 0;
-    uintptr_t searchFrom = 0;
-    while (true)
-    {
-        const uintptr_t match = ScanPattern(pattern, searchFrom);
-        if (!match)
-            break;
-        ++count;
-        searchFrom = match + 1;
-    }
-    return count;
-}
-
 static uintptr_t ResolveRipRelative(uintptr_t displacementAddress)
 {
     const int32_t displacement =
@@ -236,12 +205,8 @@ static bool LookupPdataRange(
 
 static bool ValidateFunctionEntry(
     uintptr_t entry,
-    uintptr_t expectedEntryRva,
-    uintptr_t& pdataBeginRva,
-    uintptr_t& pdataEndRva)
+    uintptr_t expectedEntryRva)
 {
-    pdataBeginRva = 0;
-    pdataEndRva = 0;
     if (!entry)
         return false;
 
@@ -254,35 +219,7 @@ static bool ValidateFunctionEntry(
     if (!LookupPdataRange(entry, pdataBegin, pdataEnd))
         return false;
 
-    pdataBeginRva = ToRva(pdataBegin);
-    pdataEndRva = ToRva(pdataEnd);
-    return pdataBeginRva == expectedEntryRva;
-}
-
-static SharedDamageWorldChrManCandidateDiag ResolveWorldChrManCandidate(
-    const char* pattern)
-{
-    SharedDamageWorldChrManCandidateDiag candidate{};
-    candidate.patternMatches = CountPatternMatches(pattern);
-    if (candidate.patternMatches != 1)
-        return candidate;
-
-    const uintptr_t instruction = ScanUniquePattern(pattern);
-    if (!instruction)
-        return candidate;
-
-    candidate.instructionRva = ToRva(instruction);
-    candidate.pointerAddress = ResolveRipRelative(instruction + 3);
-    __try
-    {
-        candidate.currentValue =
-            *reinterpret_cast<uintptr_t*>(candidate.pointerAddress);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        candidate.currentValue = 0;
-    }
-    return candidate;
+    return ToRva(pdataBegin) == expectedEntryRva && pdataEnd > pdataBegin;
 }
 
 static void OnSameWorldBecameInactive(bool onGameThread);
@@ -333,16 +270,11 @@ static SharedDamageWorldSnapshot CaptureProductionWorldSnapshot()
     if (!g_worldChrManPtr)
         return snapshot;
 
-    snapshot.worldChrManPointerAddress =
-        reinterpret_cast<uintptr_t>(g_worldChrManPtr);
-
     uintptr_t worldChrMan = 0;
-    if (!TryReadPointer(snapshot.worldChrManPointerAddress, worldChrMan) ||
+    if (!TryReadPointer(
+            reinterpret_cast<uintptr_t>(g_worldChrManPtr), worldChrMan) ||
         !worldChrMan)
         return snapshot;
-
-    snapshot.netPlayersSnapshot.worldChrMan = worldChrMan;
-    snapshot.worldChrManReadable = true;
 
     uintptr_t netPlayers = 0;
     if (!TryReadPointer(
@@ -350,41 +282,31 @@ static SharedDamageWorldSnapshot CaptureProductionWorldSnapshot()
         !netPlayers)
         return snapshot;
 
-    snapshot.netPlayersSnapshot.netPlayers = netPlayers;
-    snapshot.netPlayersReadable = true;
-
+    uintptr_t slots[NET_PLAYERS_REMOTE_SLOT_LAST + 1]{};
     for (int slot = NET_PLAYERS_LOCAL_SLOT;
-         slot <= NET_PLAYERS_PRODUCTION_SLOT_LAST;
+         slot <= NET_PLAYERS_REMOTE_SLOT_LAST;
          ++slot)
     {
-        uintptr_t chrIns = 0;
         if (!TryReadPointer(
-                netPlayers + NET_PLAYERS_SLOT_STRIDE * slot, chrIns))
+                netPlayers + NET_PLAYERS_SLOT_STRIDE * slot, slots[slot]))
             return snapshot;
 
-        snapshot.netPlayersSnapshot.slots[slot] = chrIns;
-        if (!chrIns)
+        if (!slots[slot])
             continue;
 
         uintptr_t vtable = 0;
-        if (!TryReadPointer(chrIns, vtable) || !vtable)
+        if (!TryReadPointer(slots[slot], vtable) || !vtable)
             return snapshot;
-
-        snapshot.netPlayersSnapshot.vtables[slot] = vtable;
     }
-    snapshot.productionSlotsReadComplete = true;
 
-    snapshot.localChrIns =
-        snapshot.netPlayersSnapshot.slots[NET_PLAYERS_LOCAL_SLOT];
-    if (!snapshot.localChrIns ||
-        !snapshot.netPlayersSnapshot.vtables[NET_PLAYERS_LOCAL_SLOT])
+    const uintptr_t localChrIns = slots[NET_PLAYERS_LOCAL_SLOT];
+    if (!localChrIns)
         return snapshot;
 
     uintptr_t moduleBag = 0;
-    if (!TryReadPointer(snapshot.localChrIns + 0x190, moduleBag) ||
+    if (!TryReadPointer(localChrIns + 0x190, moduleBag) ||
         !moduleBag)
         return snapshot;
-    snapshot.localModuleBag = moduleBag;
 
     uintptr_t statModule = 0;
     if (!TryReadPointer(moduleBag, statModule) || !statModule)
@@ -397,8 +319,7 @@ static SharedDamageWorldSnapshot CaptureProductionWorldSnapshot()
          slot <= NET_PLAYERS_REMOTE_SLOT_LAST;
          ++slot)
     {
-        if (snapshot.netPlayersSnapshot.slots[slot] != 0 &&
-            snapshot.netPlayersSnapshot.vtables[slot] != 0)
+        if (slots[slot] != 0)
         {
             remotePresent = true;
             break;
@@ -408,39 +329,14 @@ static SharedDamageWorldSnapshot CaptureProductionWorldSnapshot()
     snapshot.presence = remotePresent
         ? SharedWorldPresence::RemotePlayersPresent
         : SharedWorldPresence::NoRemotePlayers;
-
-    // Diagnostic-only: slots 6–7 never affect production presence/cache.
-    for (int slot = NET_PLAYERS_PRODUCTION_SLOT_LAST + 1;
-         slot <= NET_PLAYERS_DIAGNOSTIC_SLOT_LAST;
-         ++slot)
-    {
-        uintptr_t chrIns = 0;
-        if (!TryReadPointer(
-                netPlayers + NET_PLAYERS_SLOT_STRIDE * slot, chrIns))
-            continue;
-
-        snapshot.netPlayersSnapshot.slots[slot] = chrIns;
-        if (!chrIns)
-            continue;
-
-        uintptr_t vtable = 0;
-        if (TryReadPointer(chrIns, vtable) && vtable)
-            snapshot.netPlayersSnapshot.vtables[slot] = vtable;
-    }
-
     return snapshot;
 }
 
 static void UpdateProductionFromSnapshot(
     const SharedDamageWorldSnapshot& snapshot,
     SharedDamageLobbyPresence lobbyPresence,
-    bool onGameThread,
-    bool& queuesCleared,
-    const char*& transitionReason)
+    bool onGameThread)
 {
-    queuesCleared = false;
-    transitionReason = "none";
-
     switch (snapshot.presence)
     {
     case SharedWorldPresence::RemotePlayersPresent:
@@ -449,8 +345,6 @@ static void UpdateProductionFromSnapshot(
             g_cachedLocalStatModule.store(
                 snapshot.localStatModule, memory_order_release);
         }
-        if (!g_sameWorldActive.load(memory_order_acquire))
-            transitionReason = "remote-present";
         g_sameWorldActive.store(true, memory_order_release);
         break;
 
@@ -462,28 +356,23 @@ static void UpdateProductionFromSnapshot(
         }
         if (g_sameWorldActive.load(memory_order_acquire))
         {
-            transitionReason = "no-remote-players";
             g_sameWorldActive.store(false, memory_order_release);
             OnSameWorldBecameInactive(onGameThread);
             g_cachedLocalStatModule.store(0, memory_order_release);
-            queuesCleared = true;
         }
         break;
 
     case SharedWorldPresence::Unavailable:
     default:
-        transitionReason = "unavailable";
         break;
     }
 
     if (lobbyPresence == SharedDamageLobbyPresence::NoRemoteMembers &&
         g_sameWorldActive.load(memory_order_acquire))
     {
-        transitionReason = "lobby-below-two";
         g_sameWorldActive.store(false, memory_order_release);
         OnSameWorldBecameInactive(onGameThread);
         g_cachedLocalStatModule.store(0, memory_order_release);
-        queuesCleared = true;
     }
 }
 
@@ -497,169 +386,10 @@ static void InitializeProductionFromSnapshot(
             snapshot.localStatModule, memory_order_release);
     }
 
-    bool queuesCleared = false;
-    const char* transitionReason = "none";
-    UpdateProductionFromSnapshot(
-        snapshot, lobbyPresence, false, queuesCleared, transitionReason);
+    UpdateProductionFromSnapshot(snapshot, lobbyPresence, false);
 
     if (snapshot.presence == SharedWorldPresence::Unavailable)
         g_sameWorldActive.store(false, memory_order_release);
-}
-
-static void ResolveSlotDiagnosticFields(
-    SharedDamageBossNetPlayersSnapshot& snapshot, int slot)
-{
-    __try
-    {
-        const uintptr_t chrIns = snapshot.slots[slot];
-        if (!chrIns)
-            return;
-        snapshot.moduleBags[slot] =
-            *reinterpret_cast<uintptr_t*>(chrIns + 0x190);
-        if (!snapshot.moduleBags[slot])
-            return;
-        snapshot.statModules[slot] =
-            *reinterpret_cast<uintptr_t*>(snapshot.moduleBags[slot]);
-        if (!snapshot.statModules[slot])
-            return;
-        snapshot.currentHps[slot] = *reinterpret_cast<int32_t*>(
-            snapshot.statModules[slot] + 0x138);
-        snapshot.currentHpReadable[slot] = true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        snapshot.currentHpReadable[slot] = false;
-    }
-}
-
-static void PopulateSlotDiagnosticFields(
-    SharedDamageSameWorldProbeResult& probe)
-{
-    if constexpr (!kBossDiagnosticsEnabled)
-        return;
-    for (int slot = 0; slot < 8; ++slot)
-        ResolveSlotDiagnosticFields(probe.snapshot, slot);
-}
-
-static int FindMatchingStatModuleSlot(
-    const SharedDamageBossNetPlayersSnapshot& snapshot,
-    uintptr_t statModule)
-{
-    if (!statModule)
-        return -1;
-    for (int slot = 0; slot < 8; ++slot)
-    {
-        if (snapshot.statModules[slot] == statModule)
-            return slot;
-    }
-    return -1;
-}
-
-static bool WorldProbeLayoutChanged(
-    const SharedDamageSameWorldProbeResult& previous,
-    const SharedDamageSameWorldProbeResult& current)
-{
-    if (previous.active != current.active ||
-        previous.snapshot.worldChrMan != current.snapshot.worldChrMan ||
-        previous.snapshot.netPlayers != current.snapshot.netPlayers)
-        return true;
-    for (int slot = 0; slot < 8; ++slot)
-    {
-        if (previous.snapshot.slots[slot] != current.snapshot.slots[slot] ||
-            previous.snapshot.vtables[slot] != current.snapshot.vtables[slot])
-            return true;
-    }
-    return false;
-}
-
-static SharedDamageSameWorldProbeResult ProbeWorldChrManCandidate(
-    uintptr_t pointerAddress)
-{
-    SharedDamageSameWorldProbeResult result{};
-    if (!pointerAddress)
-        return result;
-
-    uintptr_t worldChrMan = 0;
-    if (!TryReadPointer(pointerAddress, worldChrMan) || !worldChrMan)
-        return result;
-    result.snapshot.worldChrMan = worldChrMan;
-
-    uintptr_t netPlayers = 0;
-    if (!TryReadPointer(
-            worldChrMan + WORLD_CHR_MAN_NET_PLAYERS_OFFSET, netPlayers) ||
-        !netPlayers)
-        return result;
-    result.snapshot.netPlayers = netPlayers;
-
-    for (int slot = NET_PLAYERS_LOCAL_SLOT;
-         slot <= NET_PLAYERS_PRODUCTION_SLOT_LAST;
-         ++slot)
-    {
-        uintptr_t chrIns = 0;
-        if (!TryReadPointer(
-                netPlayers + NET_PLAYERS_SLOT_STRIDE * slot, chrIns))
-            return result;
-
-        result.snapshot.slots[slot] = chrIns;
-        if (!chrIns)
-            continue;
-
-        uintptr_t vtable = 0;
-        if (!TryReadPointer(chrIns, vtable) || !vtable)
-            return result;
-        result.snapshot.vtables[slot] = vtable;
-    }
-
-    for (int slot = NET_PLAYERS_REMOTE_SLOT_FIRST;
-         slot <= NET_PLAYERS_REMOTE_SLOT_LAST;
-         ++slot)
-    {
-        if (result.snapshot.slots[slot] != 0 &&
-            result.snapshot.vtables[slot] != 0)
-        {
-            result.active = true;
-            break;
-        }
-    }
-
-    for (int slot = NET_PLAYERS_PRODUCTION_SLOT_LAST + 1;
-         slot <= NET_PLAYERS_DIAGNOSTIC_SLOT_LAST;
-         ++slot)
-    {
-        uintptr_t chrIns = 0;
-        if (!TryReadPointer(
-                netPlayers + NET_PLAYERS_SLOT_STRIDE * slot, chrIns))
-            continue;
-
-        result.snapshot.slots[slot] = chrIns;
-        if (!chrIns)
-            continue;
-
-        uintptr_t vtable = 0;
-        if (TryReadPointer(chrIns, vtable) && vtable)
-            result.snapshot.vtables[slot] = vtable;
-    }
-
-    return result;
-}
-
-static void LogBossDiagStartup(
-    bool hpWriteHookEnabled,
-    bool hpDelta7HookEnabled,
-    bool hpDelta8HookEnabled,
-    bool callbacksHookEnabled,
-    bool sharingReady,
-    const SharedDamageHookInstallDiag& installDiag,
-    const SharedDamageWorldSnapshot& snapshot)
-{
-    SharedDamageBossDiagLogStartup(
-        hpWriteHookEnabled,
-        hpDelta7HookEnabled,
-        hpDelta8HookEnabled,
-        callbacksHookEnabled,
-        sharingReady,
-        snapshot.netPlayersSnapshot,
-        installDiag);
 }
 
 static void ClearPendingDamageContext()
@@ -675,85 +405,45 @@ static void OnSameWorldBecameInactive(bool onGameThread)
         ClearPendingDamageContext();
 }
 
-static const char* PendingSourceToString(PendingDamageSource source)
-{
-    switch (source)
-    {
-    case PendingDamageSource::HpDelta7:
-        return "hp-delta-7";
-    case PendingDamageSource::HpDelta8:
-        return "hp-delta-8";
-    default:
-        return "none";
-    }
-}
-
-static uint32_t TryCapturePendingRawDamage(
+static bool TryCapturePendingRawDamage(
     uintptr_t statModule,
-    int32_t deltaHp,
-    PendingDamageSource sourceWrapper)
+    int32_t deltaHp)
 {
     if (deltaHp >= 0)
-        return 0;
+        return false;
 
     const uintptr_t local =
         g_cachedLocalStatModule.load(memory_order_acquire);
     if (local == 0 || statModule != local)
-        return 0;
+        return false;
 
     const int64_t rawDamage64 = -static_cast<int64_t>(deltaHp);
     if (rawDamage64 > numeric_limits<int32_t>::max())
-        return 0;
+        return false;
 
-    const uint32_t captureSeq =
-        g_nextCaptureSeq.fetch_add(1, memory_order_relaxed);
     g_pendingDamage = {
         statModule,
         static_cast<int32_t>(rawDamage64),
         GetTickCount64(),
-        true,
-        captureSeq,
-        sourceWrapper};
-    return captureSeq;
+        true};
+    return true;
 }
 
 static bool TryConsumePendingRawDamage(
     uintptr_t statModule,
-    int32_t& damage,
-    BossPendingConsumeDiag* diag)
+    int32_t& damage)
 {
-    if (diag)
-    {
-        diag->pendingSeq = 0;
-        diag->pendingAgeMs = 0;
-        diag->result = "no-pending";
-        diag->pendingSource = PendingDamageSource::None;
-    }
-
     if (!g_pendingDamage.active)
         return false;
 
-    if (diag)
-    {
-        diag->pendingSeq = g_pendingDamage.captureSeq;
-        diag->pendingSource = g_pendingDamage.sourceWrapper;
-    }
-
-    if (diag)
-        diag->pendingAgeMs = GetTickCount64() - g_pendingDamage.tickMs;
-
     if (g_pendingDamage.statModule != statModule)
     {
-        if (diag)
-            diag->result = "stat-mismatch";
         g_pendingDamage = {};
         return false;
     }
 
     if (g_pendingDamage.rawDamage <= 0)
     {
-        if (diag)
-            diag->result = "invalid-damage";
         g_pendingDamage = {};
         return false;
     }
@@ -761,79 +451,35 @@ static bool TryConsumePendingRawDamage(
     const ULONGLONG age = GetTickCount64() - g_pendingDamage.tickMs;
     if (age > PENDING_DAMAGE_TTL_MS)
     {
-        if (diag)
-            diag->result = "expired";
         g_pendingDamage = {};
         return false;
     }
 
     damage = g_pendingDamage.rawDamage;
-    if (diag)
-        diag->result = "matched";
     g_pendingDamage = {};
     return true;
 }
 
-struct ProductionSnapshotUpdateResult
-{
-    bool latchedBefore = false;
-    bool latchedAfter = false;
-    bool queuesCleared = false;
-    const char* transitionReason = "none";
-    SharedDamageLobbyPresence lobbyPresence =
-        SharedDamageLobbyPresence::Unknown;
-};
-
-static ProductionSnapshotUpdateResult PublishProductionSnapshot(
+static void PublishProductionSnapshot(
     const SharedDamageWorldSnapshot& snapshot,
     bool onGameThread)
 {
-    g_lastProductionSnapshot = snapshot;
-
-    ProductionSnapshotUpdateResult result{};
-    result.latchedBefore =
-        g_sameWorldActive.load(memory_order_acquire);
-    result.lobbyPresence = GetSharedDamageLobbyPresence();
-
     UpdateProductionFromSnapshot(
         snapshot,
-        result.lobbyPresence,
-        onGameThread,
-        result.queuesCleared,
-        result.transitionReason);
-
-    result.latchedAfter =
-        g_sameWorldActive.load(memory_order_acquire);
-
-    if (result.latchedBefore != result.latchedAfter)
-    {
-        SharedDamageBossDiagLogSameWorldTransition(
-            result.latchedBefore,
-            result.latchedAfter,
-            snapshot.netPlayersSnapshot);
-    }
-
-    return result;
+        GetSharedDamageLobbyPresence(),
+        onGameThread);
 }
 
-static void TryLogUnifiedProductionSnapshot(
-    const SharedDamageWorldSnapshot& snapshot,
-    const ProductionSnapshotUpdateResult& update,
-    uint64_t callbackInvocationCount,
-    const char* snapshotSource)
+static void ApplyDamageToLocalPlayer(
+    uintptr_t statModule, int32_t damage)
 {
-    const uint32_t snapshotSeq =
-        g_nextSnapshotSeq.fetch_add(1, memory_order_relaxed) + 1;
-    SharedDamageBossDiagTryLogUnifiedWorldSnapshot(
-        snapshotSeq,
-        callbackInvocationCount,
-        snapshot,
-        update.latchedBefore,
-        update.latchedAfter,
-        update.lobbyPresence,
-        update.transitionReason,
-        update.queuesCleared,
-        snapshotSource);
+    if (damage <= 0 || !fpDamageFunc || !statModule)
+        return;
+
+    const int32_t currentHp =
+        *reinterpret_cast<int32_t*>(statModule + 0x138);
+    const int32_t newHp = max(0, currentHp - damage);
+    fpDamageFunc(statModule, newHp);
 }
 
 static void DrainRemoteDamageFromSnapshot(
@@ -850,96 +496,23 @@ static void DrainRemoteDamageFromSnapshot(
         min<int64_t>(pending, numeric_limits<int32_t>::max()));
 
     if (!IsSameWorldActive())
-    {
-        SharedDamageBossDiagTryLogDrainApply(
-            pending,
-            false,
-            "same-world-inactive",
-            damage,
-            -1,
-            -1);
         return;
-    }
 
     if (presence == SharedWorldPresence::Unavailable)
-    {
-        SharedDamageBossDiagTryLogDrainApply(
-            pending,
-            false,
-            "current-snapshot-unavailable",
-            damage,
-            -1,
-            -1);
         return;
-    }
 
     if (!localPlayerResolved || !localStatModule)
-    {
-        SharedDamageBossDiagTryLogDrainApply(
-            pending,
-            false,
-            "local-player-unresolved",
-            damage,
-            -1,
-            -1);
         return;
-    }
 
-    ApplyDamageToLocalPlayer(localStatModule, damage, pending);
+    ApplyDamageToLocalPlayer(localStatModule, damage);
 }
 
 static void __fastcall hkHpDelta7(
     uintptr_t statModule, int32_t deltaHp, uint8_t flagA, uint8_t flagB,
     float arg5, float arg6, uint8_t flagC)
 {
-    const uintptr_t local =
-        g_cachedLocalStatModule.load(memory_order_acquire);
-    const bool modulesMatch = local != 0 && statModule == local;
-    const uintptr_t callerAddress =
-        reinterpret_cast<uintptr_t>(_ReturnAddress());
-    const uintptr_t moduleBase = GetGameModuleBase();
-    const uintptr_t callerRva =
-        moduleBase && callerAddress >= moduleBase
-            ? callerAddress - moduleBase
-            : 0;
-
-    uint32_t captureSeq = 0;
-    bool captureRan = false;
     if (deltaHp < 0)
-    {
-        captureSeq = TryCapturePendingRawDamage(
-            statModule, deltaHp, PendingDamageSource::HpDelta7);
-        captureRan = captureSeq != 0;
-    }
-
-    SharedDamageBossDiagTryLogDelta7Entry(
-        statModule,
-        local,
-        deltaHp,
-        modulesMatch,
-        callerRva,
-        captureRan,
-        captureSeq);
-
-    if (deltaHp < 0)
-    {
-        if (modulesMatch)
-        {
-            SharedDamageBossDiagTryLogDeltaLocal(
-                captureSeq,
-                statModule,
-                local,
-                deltaHp,
-                callerRva,
-                "hp-delta-7",
-                captureRan);
-        }
-        else
-        {
-            SharedDamageBossDiagTryLogDeltaNonLocal(
-                statModule, local, deltaHp, callerRva);
-        }
-    }
+        TryCapturePendingRawDamage(statModule, deltaHp);
 
     fpHpDelta7(statModule, deltaHp, flagA, flagB, arg5, arg6, flagC);
 }
@@ -948,54 +521,8 @@ static void __fastcall hkHpDelta8(
     uintptr_t statModule, int32_t deltaHp, uint8_t flagA, uint8_t flagB,
     uint8_t flagC, float arg6, float arg7, uint8_t flagD)
 {
-    const uintptr_t local =
-        g_cachedLocalStatModule.load(memory_order_acquire);
-    const bool modulesMatch = local != 0 && statModule == local;
-    const uintptr_t callerAddress =
-        reinterpret_cast<uintptr_t>(_ReturnAddress());
-    const uintptr_t moduleBase = GetGameModuleBase();
-    const uintptr_t callerRva =
-        moduleBase && callerAddress >= moduleBase
-            ? callerAddress - moduleBase
-            : 0;
-
-    uint32_t captureSeq = 0;
-    bool captureRan = false;
     if (deltaHp < 0)
-    {
-        captureSeq = TryCapturePendingRawDamage(
-            statModule, deltaHp, PendingDamageSource::HpDelta8);
-        captureRan = captureSeq != 0;
-    }
-
-    SharedDamageBossDiagTryLogDelta8Entry(
-        statModule,
-        local,
-        deltaHp,
-        modulesMatch,
-        callerRva,
-        captureRan,
-        captureSeq);
-
-    if (deltaHp < 0)
-    {
-        if (modulesMatch)
-        {
-            SharedDamageBossDiagTryLogDeltaLocal(
-                captureSeq,
-                statModule,
-                local,
-                deltaHp,
-                callerRva,
-                "hp-delta-8",
-                captureRan);
-        }
-        else
-        {
-            SharedDamageBossDiagTryLogDeltaNonLocal(
-                statModule, local, deltaHp, callerRva);
-        }
-    }
+        TryCapturePendingRawDamage(statModule, deltaHp);
 
     fpHpDelta8(
         statModule, deltaHp, flagA, flagB, flagC, arg6, arg7, flagD);
@@ -1003,19 +530,11 @@ static void __fastcall hkHpDelta8(
 
 static void __fastcall hkDamageFunc(uintptr_t statModule, int32_t newHp)
 {
-    const uintptr_t callerAddress =
-        reinterpret_cast<uintptr_t>(_ReturnAddress());
     if (!g_runCallbacksHookInstalled.load(memory_order_acquire))
     {
         const SharedDamageWorldSnapshot snapshot =
             CaptureProductionWorldSnapshot();
-        const ProductionSnapshotUpdateResult update =
-            PublishProductionSnapshot(snapshot, true);
-        TryLogUnifiedProductionSnapshot(
-            snapshot,
-            update,
-            0,
-            "hp-write-fallback");
+        PublishProductionSnapshot(snapshot, true);
         DrainRemoteDamageFromSnapshot(
             snapshot.localStatModule,
             snapshot.localPlayerResolved,
@@ -1033,56 +552,13 @@ static void __fastcall hkDamageFunc(uintptr_t statModule, int32_t newHp)
     const int32_t currentHp =
         *reinterpret_cast<int32_t*>(local + 0x138);
     int32_t rawDamage = 0;
-    BossPendingConsumeDiag consumeDiag{};
     const bool hasRawDamage =
-        TryConsumePendingRawDamage(local, rawDamage, &consumeDiag);
+        TryConsumePendingRawDamage(local, rawDamage);
 
     fpDamageFunc(statModule, newHp);
 
     const bool finalDecrease = currentHp > 0 && newHp < currentHp;
     const bool sameWorldActive = IsSameWorldActive();
-
-    if (finalDecrease)
-    {
-        const char* decision = "no-provenance";
-        if (hasRawDamage && rawDamage > 0 && sameWorldActive)
-            decision = "broadcast";
-        else if (hasRawDamage && rawDamage > 0)
-            decision = "same-world-inactive";
-
-        int matchingNetPlayerSlot = -1;
-        uintptr_t callerRva = 0;
-        if (SharedDamageBossDiagCanLogHpDecrease())
-        {
-            SharedDamageBossNetPlayersSnapshot diagSnapshot =
-                g_lastProductionSnapshot.netPlayersSnapshot;
-            SharedDamageSameWorldProbeResult diagProbe{};
-            diagProbe.snapshot = diagSnapshot;
-            PopulateSlotDiagnosticFields(diagProbe);
-            matchingNetPlayerSlot =
-                FindMatchingStatModuleSlot(diagProbe.snapshot, statModule);
-            const uintptr_t moduleBase = GetGameModuleBase();
-            callerRva = moduleBase && callerAddress >= moduleBase
-                ? callerAddress - moduleBase
-                : 0;
-        }
-
-        SharedDamageBossDiagTryLogHpDecrease(
-            statModule,
-            local,
-            local,
-            matchingNetPlayerSlot,
-            callerRva,
-            currentHp,
-            newHp,
-            hasRawDamage,
-            rawDamage,
-            consumeDiag.pendingSeq,
-            consumeDiag.pendingAgeMs,
-            consumeDiag.result,
-            PendingSourceToString(consumeDiag.pendingSource),
-            decision);
-    }
 
     if (hasRawDamage && rawDamage > 0 && finalDecrease && sameWorldActive)
     {
@@ -1094,73 +570,11 @@ static void __fastcall hkDamageFunc(uintptr_t statModule, int32_t newHp)
 
 static void hkRunCallbacks()
 {
-    const uint64_t callbackInvocationCount =
-        SharedDamageBossDiagNotifyCallbackInvocation();
     fpRunCallbacks();
 
     const SharedDamageWorldSnapshot snapshot =
         CaptureProductionWorldSnapshot();
-    const ProductionSnapshotUpdateResult update =
-        PublishProductionSnapshot(snapshot, true);
-    TryLogUnifiedProductionSnapshot(
-        snapshot,
-        update,
-        callbackInvocationCount,
-        "steam-callback");
-
-    const ULONGLONG now = GetTickCount64();
-    ULONGLONG nextProbe =
-        g_nextWorldProbeTickMs.load(memory_order_relaxed);
-    if (now >= nextProbe &&
-        g_nextWorldProbeTickMs.compare_exchange_strong(
-            nextProbe, now + 1000, memory_order_relaxed, memory_order_relaxed))
-    {
-        SharedDamageSameWorldProbeResult productionProbe{};
-        productionProbe.snapshot = snapshot.netPlayersSnapshot;
-        productionProbe.active =
-            snapshot.presence == SharedWorldPresence::RemotePlayersPresent;
-        PopulateSlotDiagnosticFields(productionProbe);
-
-        SharedDamageWorldChrManCandidateProbe primaryProbe{};
-        primaryProbe.pointerAddress = g_diagPrimaryWorldChrManPtrAddr;
-        primaryProbe.probe = ProbeWorldChrManCandidate(primaryProbe.pointerAddress);
-        PopulateSlotDiagnosticFields(primaryProbe.probe);
-
-        SharedDamageWorldChrManCandidateProbe fallbackProbe{};
-        fallbackProbe.pointerAddress = g_diagFallbackWorldChrManPtrAddr;
-        fallbackProbe.probe =
-            ProbeWorldChrManCandidate(fallbackProbe.pointerAddress);
-        PopulateSlotDiagnosticFields(fallbackProbe.probe);
-
-        const int matchingSlot = FindMatchingStatModuleSlot(
-            productionProbe.snapshot, snapshot.localStatModule);
-        ++g_worldProbeSampleCount;
-        const bool layoutChanged =
-            !g_havePreviousWorldProbe ||
-            WorldProbeLayoutChanged(g_previousWorldProbe, productionProbe);
-        const bool periodicSample =
-            g_worldProbeSampleCount <= 2 ||
-            (g_worldProbeSampleCount % 10) == 0;
-        if (layoutChanged || periodicSample)
-        {
-            const bool candidatesAlias =
-                g_diagPrimaryWorldChrManPtrAddr != 0 &&
-                g_diagPrimaryWorldChrManPtrAddr ==
-                    g_diagFallbackWorldChrManPtrAddr;
-            SharedDamageBossDiagTryLogWorldProbe(
-                snapshot.worldChrManPointerAddress,
-                productionProbe,
-                primaryProbe,
-                fallbackProbe,
-                candidatesAlias,
-                snapshot.localStatModule,
-                matchingSlot,
-                callbackInvocationCount);
-        }
-        g_previousWorldProbe = productionProbe;
-        g_havePreviousWorldProbe = true;
-        LogSharedDamageSteamStateIfChanged(callbackInvocationCount);
-    }
+    PublishProductionSnapshot(snapshot, true);
 
     FlushBroadcastDamage();
     DrainRemoteDamageFromSnapshot(
@@ -1170,120 +584,30 @@ static void hkRunCallbacks()
 }
 }
 
-uintptr_t* g_worldChrManPtr = nullptr;
-DamageFunc_t fpDamageFunc = nullptr;
-
 bool IsSameWorldActive()
 {
     return g_sameWorldActive.load(memory_order_acquire);
 }
 
-void DrainRemoteDamage(
-    uintptr_t localStatModule,
-    bool localPlayerResolved,
-    SharedWorldPresence presence)
-{
-    DrainRemoteDamageFromSnapshot(
-        localStatModule, localPlayerResolved, presence);
-}
-
 void EnqueueRemoteDamage(int32_t damage)
 {
     if (damage <= 0)
-    {
-        SharedDamageBossDiagTryLogEnqueue(
-            damage, false, "nonpositive-damage", 0);
         return;
-    }
 
     if (!IsSameWorldActive())
-    {
-        SharedDamageBossDiagTryLogEnqueue(
-            damage, false, "same-world-inactive", 0);
         return;
-    }
 
-    const int64_t pendingTotal =
-        g_damagePendingTotal.fetch_add(damage, memory_order_release) + damage;
-    SharedDamageBossDiagTryLogEnqueue(
-        damage, true, "accepted", pendingTotal);
-}
-
-void ApplyDamageToLocalPlayer(
-    uintptr_t statModule, int32_t damage, int64_t pendingAmount)
-{
-    if (damage <= 0)
-    {
-        SharedDamageBossDiagTryLogDrainApply(
-            pendingAmount,
-            false,
-            "nonpositive-damage",
-            damage,
-            -1,
-            -1);
-        return;
-    }
-
-    if (!fpDamageFunc)
-    {
-        SharedDamageBossDiagTryLogDrainApply(
-            pendingAmount,
-            false,
-            "hp-write-hook-missing",
-            damage,
-            -1,
-            -1);
-        return;
-    }
-
-    if (!statModule)
-    {
-        SharedDamageBossDiagTryLogDrainApply(
-            pendingAmount,
-            false,
-            "local-player-unresolved",
-            damage,
-            -1,
-            -1);
-        return;
-    }
-
-    const int32_t currentHp =
-        *reinterpret_cast<int32_t*>(statModule + 0x138);
-    const int32_t newHp = max(0, currentHp - damage);
-    fpDamageFunc(statModule, newHp);
-    SharedDamageBossDiagTryLogDrainApply(
-        pendingAmount,
-        true,
-        "applied",
-        damage,
-        currentHp,
-        newHp);
+    g_damagePendingTotal.fetch_add(damage, memory_order_release);
 }
 
 void InitHooks()
 {
-    bool hpWriteHookEnabled = false;
-    bool hpDelta7HookEnabled = false;
-    bool hpDelta8HookEnabled = false;
-    bool callbacksHookEnabled = false;
-    bool sharingReady = false;
-    SharedDamageHookInstallDiag installDiag{};
-    installDiag.moduleBase = GetGameModuleBase();
-
-    installDiag.primaryWorldChrMan =
-        ResolveWorldChrManCandidate(WORLD_CHR_MAN_PATTERN);
-    installDiag.fallbackWorldChrMan =
-        ResolveWorldChrManCandidate(WORLD_CHR_MAN_PATTERN_FALLBACK);
-    g_diagPrimaryWorldChrManPtrAddr =
-        installDiag.primaryWorldChrMan.pointerAddress;
-    g_diagFallbackWorldChrManPtrAddr =
-        installDiag.fallbackWorldChrMan.pointerAddress;
-
-    if (installDiag.fallbackWorldChrMan.pointerAddress != 0)
+    const uintptr_t worldChrManInstruction =
+        ScanUniquePattern(WORLD_CHR_MAN_PATTERN_FALLBACK);
+    if (worldChrManInstruction)
     {
         g_worldChrManPtr = reinterpret_cast<uintptr_t*>(
-            installDiag.fallbackWorldChrMan.pointerAddress);
+            ResolveRipRelative(worldChrManInstruction + 3));
         for (int attempt = 0; attempt < 600; ++attempt)
         {
             if (*g_worldChrManPtr)
@@ -1296,221 +620,90 @@ void InitHooks()
         g_worldChrManPtr =
             reinterpret_cast<uintptr_t*>(WaitForWorldChrMan());
     }
-    installDiag.worldChrManPointerAddress =
-        reinterpret_cast<uintptr_t>(g_worldChrManPtr);
 
     const SharedDamageWorldSnapshot initSnapshot =
         CaptureProductionWorldSnapshot();
-    g_lastProductionSnapshot = initSnapshot;
     InitializeProductionFromSnapshot(
         initSnapshot, GetSharedDamageLobbyPresence());
 
-    installDiag.damagePatternMatches =
-        CountPatternMatches(DAMAGE_FUNC_PROLOGUE);
     const uintptr_t damageEntry = ScanUniquePattern(DAMAGE_FUNC_PROLOGUE);
-    installDiag.damagePatternMatch = damageEntry;
-    installDiag.damageEntry = damageEntry;
-    installDiag.damageEntryRva = ToRva(damageEntry);
-    installDiag.damagePrologueValid = ValidateFunctionEntry(
-        damageEntry,
-        HP_WRITE_EXPECTED_RVA,
-        installDiag.damagePdataBeginRva,
-        installDiag.damagePdataEndRva);
-
-    installDiag.hpDelta7Matches =
-        CountPatternMatches(HP_DELTA7_WRAPPER_PATTERN);
     const uintptr_t hpDelta7Match =
         ScanUniquePattern(HP_DELTA7_WRAPPER_PATTERN);
-    installDiag.hpDelta7PatternMatch = hpDelta7Match;
     const uintptr_t hpDelta7Entry =
         (hpDelta7Match >= HP_DELTA7_WRAPPER_BACKTRACK)
             ? hpDelta7Match - HP_DELTA7_WRAPPER_BACKTRACK
             : 0;
-    installDiag.hpDelta7Entry = hpDelta7Entry;
-    installDiag.hpDelta7EntryRva = ToRva(hpDelta7Entry);
-    installDiag.hpDelta7PrologueValid = ValidateFunctionEntry(
-        hpDelta7Entry,
-        HP_DELTA7_EXPECTED_RVA,
-        installDiag.hpDelta7PdataBeginRva,
-        installDiag.hpDelta7PdataEndRva);
-
-    installDiag.hpDelta8Matches =
-        CountPatternMatches(HP_DELTA8_WRAPPER_PATTERN);
     const uintptr_t hpDelta8Entry =
         ScanUniquePattern(HP_DELTA8_WRAPPER_PATTERN);
-    installDiag.hpDelta8Entry = hpDelta8Entry;
-    installDiag.hpDelta8EntryRva = ToRva(hpDelta8Entry);
-    installDiag.hpDelta8PrologueValid = ValidateFunctionEntry(
-        hpDelta8Entry,
-        HP_DELTA8_EXPECTED_RVA,
-        installDiag.hpDelta8PdataBeginRva,
-        installDiag.hpDelta8PdataEndRva);
 
-    if (!damageEntry || installDiag.damagePatternMatches != 1 ||
-        !installDiag.damagePrologueValid)
-    {
-        installDiag.failedStage = "hp-write-scan-or-pdata";
-        LogBossDiagStartup(
-            hpWriteHookEnabled,
-            hpDelta7HookEnabled,
-            hpDelta8HookEnabled,
-            callbacksHookEnabled,
-            sharingReady,
-            installDiag,
-            initSnapshot);
+    if (!ValidateFunctionEntry(damageEntry, HP_WRITE_EXPECTED_RVA) ||
+        !ValidateFunctionEntry(hpDelta7Entry, HP_DELTA7_EXPECTED_RVA) ||
+        !ValidateFunctionEntry(hpDelta8Entry, HP_DELTA8_EXPECTED_RVA))
         return;
-    }
-
-    if (!hpDelta7Entry || installDiag.hpDelta7Matches != 1 ||
-        !installDiag.hpDelta7PrologueValid)
-    {
-        installDiag.failedStage = "hp-delta7-scan-or-pdata";
-        LogBossDiagStartup(
-            hpWriteHookEnabled,
-            hpDelta7HookEnabled,
-            hpDelta8HookEnabled,
-            callbacksHookEnabled,
-            sharingReady,
-            installDiag,
-            initSnapshot);
-        return;
-    }
-
-    if (!hpDelta8Entry || installDiag.hpDelta8Matches != 1 ||
-        !installDiag.hpDelta8PrologueValid)
-    {
-        installDiag.failedStage = "hp-delta8-scan-or-pdata";
-        LogBossDiagStartup(
-            hpWriteHookEnabled,
-            hpDelta7HookEnabled,
-            hpDelta8HookEnabled,
-            callbacksHookEnabled,
-            sharingReady,
-            installDiag,
-            initSnapshot);
-        return;
-    }
 
     const MH_STATUS initializeStatus = MH_Initialize();
-    installDiag.mhInitializeResult = static_cast<int>(initializeStatus);
     if (initializeStatus != MH_OK &&
         initializeStatus != MH_ERROR_ALREADY_INITIALIZED)
-    {
-        installDiag.failedStage = "mh-initialize";
-        LogBossDiagStartup(
-            hpWriteHookEnabled,
-            hpDelta7HookEnabled,
-            hpDelta8HookEnabled,
-            callbacksHookEnabled,
-            sharingReady,
-            installDiag,
-            initSnapshot);
         return;
-    }
 
     const MH_STATUS hpWriteCreateStatus = MH_CreateHook(
         reinterpret_cast<void*>(damageEntry),
         reinterpret_cast<void*>(&hkDamageFunc),
         reinterpret_cast<void**>(&fpDamageFunc));
-    installDiag.hpWriteCreateResult = static_cast<int>(hpWriteCreateStatus);
-
     const MH_STATUS hpDelta7CreateStatus = MH_CreateHook(
         reinterpret_cast<void*>(hpDelta7Entry),
         reinterpret_cast<void*>(&hkHpDelta7),
         reinterpret_cast<void**>(&fpHpDelta7));
-    installDiag.hpDelta7CreateResult = static_cast<int>(hpDelta7CreateStatus);
-
     const MH_STATUS hpDelta8CreateStatus = MH_CreateHook(
         reinterpret_cast<void*>(hpDelta8Entry),
         reinterpret_cast<void*>(&hkHpDelta8),
         reinterpret_cast<void**>(&fpHpDelta8));
-    installDiag.hpDelta8CreateResult = static_cast<int>(hpDelta8CreateStatus);
 
-    bool callbacksHookCreated = false;
     const MH_STATUS callbacksCreateStatus = MH_CreateHookApi(
         L"steam_api64", "SteamAPI_RunCallbacks",
         reinterpret_cast<void*>(&hkRunCallbacks),
         reinterpret_cast<void**>(&fpRunCallbacks));
-    installDiag.callbacksCreateResult = static_cast<int>(callbacksCreateStatus);
     if (callbacksCreateStatus == MH_OK)
-    {
-        callbacksHookCreated = true;
         g_runCallbacksHookInstalled.store(true, memory_order_release);
-    }
     else
     {
         fpRunCallbacks = nullptr;
         g_runCallbacksHookInstalled.store(false, memory_order_release);
     }
 
-    if (hpWriteCreateStatus != MH_OK)
-        installDiag.failedStage = "hp-write-create";
-    else if (hpDelta7CreateStatus != MH_OK)
-        installDiag.failedStage = "hp-delta7-create";
-    else if (hpDelta8CreateStatus != MH_OK)
-        installDiag.failedStage = "hp-delta8-create";
-
     if (hpWriteCreateStatus != MH_OK || hpDelta7CreateStatus != MH_OK ||
         hpDelta8CreateStatus != MH_OK)
     {
-        LogBossDiagStartup(
-            hpWriteHookEnabled,
-            hpDelta7HookEnabled,
-            hpDelta8HookEnabled,
-            callbacksHookEnabled,
-            sharingReady,
-            installDiag,
-            initSnapshot);
-        return;
-    }
-
-    const MH_STATUS enableStatus = MH_EnableHook(MH_ALL_HOOKS);
-    installDiag.enableResult = static_cast<int>(enableStatus);
-    if (enableStatus != MH_OK)
-    {
-        installDiag.failedStage = "mh-enable";
-        installDiag.mhDisableResult =
-            static_cast<int>(MH_DisableHook(MH_ALL_HOOKS));
+        MH_Uninitialize();
         fpDamageFunc = nullptr;
         fpHpDelta7 = nullptr;
         fpHpDelta8 = nullptr;
         fpRunCallbacks = nullptr;
         g_runCallbacksHookInstalled.store(false, memory_order_release);
-        callbacksHookEnabled = false;
-        LogBossDiagStartup(
-            hpWriteHookEnabled,
-            hpDelta7HookEnabled,
-            hpDelta8HookEnabled,
-            callbacksHookEnabled,
-            sharingReady,
-            installDiag,
-            initSnapshot);
         return;
     }
 
-    hpWriteHookEnabled = true;
-    hpDelta7HookEnabled = true;
-    hpDelta8HookEnabled = true;
-    callbacksHookEnabled = callbacksHookCreated;
-    sharingReady = true;
+    const MH_STATUS enableStatus = MH_EnableHook(MH_ALL_HOOKS);
+    if (enableStatus != MH_OK)
+    {
+        MH_DisableHook(MH_ALL_HOOKS);
+        MH_Uninitialize();
+        fpDamageFunc = nullptr;
+        fpHpDelta7 = nullptr;
+        fpHpDelta8 = nullptr;
+        fpRunCallbacks = nullptr;
+        g_runCallbacksHookInstalled.store(false, memory_order_release);
+        return;
+    }
+
     const SharedDamageWorldSnapshot postHookSnapshot =
         CaptureProductionWorldSnapshot();
-    g_lastProductionSnapshot = postHookSnapshot;
-    LogBossDiagStartup(
-        hpWriteHookEnabled,
-        hpDelta7HookEnabled,
-        hpDelta8HookEnabled,
-        callbacksHookEnabled,
-        sharingReady,
-        installDiag,
-        postHookSnapshot);
     InitializeProductionFromSnapshot(
         postHookSnapshot, GetSharedDamageLobbyPresence());
 }
 
 void ShutdownHooks()
 {
-    ShutdownSharedDamageBossDiag();
     MH_DisableHook(MH_ALL_HOOKS);
     MH_Uninitialize();
     g_cachedLocalStatModule.store(0, memory_order_release);
@@ -1518,14 +711,6 @@ void ShutdownHooks()
     DiscardPendingBroadcastDamage();
     g_sameWorldActive.store(false, memory_order_release);
     g_runCallbacksHookInstalled.store(false, memory_order_release);
-    g_nextWorldProbeTickMs.store(0, memory_order_relaxed);
-    g_worldProbeSampleCount = 0;
-    g_havePreviousWorldProbe = false;
-    g_previousWorldProbe = {};
-    g_lastProductionSnapshot = {};
-    g_nextSnapshotSeq.store(0, memory_order_relaxed);
-    g_diagPrimaryWorldChrManPtrAddr = 0;
-    g_diagFallbackWorldChrManPtrAddr = 0;
     g_worldChrManPtr = nullptr;
     fpDamageFunc = nullptr;
     fpHpDelta7 = nullptr;

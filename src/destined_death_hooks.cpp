@@ -119,21 +119,6 @@ static bool IsExecutableAddress(uintptr_t address)
            protection == PAGE_EXECUTE_WRITECOPY;
 }
 
-static bool SameCommittedRegion(uintptr_t first, uintptr_t second)
-{
-    MEMORY_BASIC_INFORMATION firstInfo{};
-    MEMORY_BASIC_INFORMATION secondInfo{};
-    if (VirtualQuery(
-            reinterpret_cast<void*>(first), &firstInfo, sizeof(firstInfo)) != sizeof(firstInfo) ||
-        VirtualQuery(
-            reinterpret_cast<void*>(second), &secondInfo, sizeof(secondInfo)) != sizeof(secondInfo))
-        return false;
-    return firstInfo.State == MEM_COMMIT &&
-           secondInfo.State == MEM_COMMIT &&
-           firstInfo.BaseAddress == secondInfo.BaseAddress &&
-           firstInfo.RegionSize == secondInfo.RegionSize;
-}
-
 static uintptr_t ScanPattern(const char* pattern, uintptr_t startFrom = 0)
 {
     vector<string> tokens;
@@ -248,25 +233,52 @@ static bool HasExpectedInnerPrologue(uintptr_t address)
            memcmp(reinterpret_cast<void*>(address), expected, sizeof(expected)) == 0;
 }
 
+static bool LookupPdataRange(
+    uintptr_t address, uintptr_t& begin, uintptr_t& end)
+{
+    DWORD64 imageBase = 0;
+    RUNTIME_FUNCTION* runtimeFunction =
+        RtlLookupFunctionEntry(address, &imageBase, nullptr);
+    if (!runtimeFunction)
+        return false;
+    begin = imageBase + runtimeFunction->BeginAddress;
+    end = imageBase + runtimeFunction->EndAddress;
+    return end > begin;
+}
+
 static uintptr_t ResolveInnerApplyTarget()
 {
-    const uintptr_t match =
+    const uintptr_t patternMatch =
         ScanUniquePattern(HIGH_LEVEL_SPEFFECT_PATTERN);
-    if (match < HIGH_LEVEL_SPEFFECT_ENTRY_BACKTRACK)
+    if (patternMatch < HIGH_LEVEL_SPEFFECT_ENTRY_BACKTRACK)
         return 0;
 
     const uintptr_t highLevelEntry =
-        match - HIGH_LEVEL_SPEFFECT_ENTRY_BACKTRACK;
-    const uintptr_t innerEntry = ResolveE8CallTarget(
-        highLevelEntry + HIGH_LEVEL_TO_INNER_CALL_OFFSET);
+        patternMatch - HIGH_LEVEL_SPEFFECT_ENTRY_BACKTRACK;
+    const uintptr_t callInstruction =
+        highLevelEntry + HIGH_LEVEL_TO_INNER_CALL_OFFSET;
 
-    if (!innerEntry ||
-        !IsExecutableAddress(highLevelEntry) ||
-        !IsExecutableAddress(innerEntry) ||
-        !SameCommittedRegion(highLevelEntry, match) ||
-        !SameCommittedRegion(highLevelEntry, innerEntry) ||
+    uintptr_t highBegin = 0;
+    uintptr_t highEnd = 0;
+    if (!IsExecutableAddress(highLevelEntry) ||
         !HasExpectedHighLevelPrologue(highLevelEntry) ||
-        !HasExpectedInnerPrologue(innerEntry))
+        !LookupPdataRange(highLevelEntry, highBegin, highEnd) ||
+        highBegin != highLevelEntry ||
+        patternMatch < highBegin || patternMatch >= highEnd ||
+        callInstruction < highBegin ||
+        callInstruction > highEnd - 5)
+        return 0;
+
+    const uintptr_t innerEntry = ResolveE8CallTarget(callInstruction);
+    if (!innerEntry)
+        return 0;
+
+    uintptr_t innerBegin = 0;
+    uintptr_t innerEnd = 0;
+    if (!IsExecutableAddress(innerEntry) ||
+        !HasExpectedInnerPrologue(innerEntry) ||
+        !LookupPdataRange(innerEntry, innerBegin, innerEnd) ||
+        innerBegin != innerEntry)
         return 0;
 
     return innerEntry;
@@ -346,11 +358,13 @@ static bool __fastcall hkChrInsApplySpEffectInner(
     uint8_t stackArg8,
     uint8_t stackArg9)
 {
-    if (spEffectId == DESTINED_DEATH_SPEFFECT_ID &&
-        HasActiveSpEffect(
-            targetChrIns, PERFECT_DEFLECT_MARKER_ID) ==
-            ActiveSpEffectResult::Present)
-        return false;
+    if (spEffectId == DESTINED_DEATH_SPEFFECT_ID)
+    {
+        const ActiveSpEffectResult lookup =
+            HasActiveSpEffect(targetChrIns, PERFECT_DEFLECT_MARKER_ID);
+        if (lookup == ActiveSpEffectResult::Present)
+            return false;
+    }
 
     return fpChrInsApplySpEffectInner(
         targetChrIns,
@@ -363,10 +377,62 @@ static bool __fastcall hkChrInsApplySpEffectInner(
         stackArg8,
         stackArg9);
 }
+
+static void CleanupCreatedHook(uintptr_t innerEntry)
+{
+    if (!innerEntry)
+        return;
+    MH_DisableHook(reinterpret_cast<void*>(innerEntry));
+    MH_RemoveHook(reinterpret_cast<void*>(innerEntry));
+    fpChrInsApplySpEffectInner = nullptr;
+}
+}
+
+bool IsSupportedDestinedDeathExecutable()
+{
+    HMODULE module = GetModuleHandleW(L"eldenring.exe");
+    if (!module)
+        module = GetModuleHandleW(nullptr);
+    if (!module)
+        return false;
+
+    wchar_t path[MAX_PATH]{};
+    if (GetModuleFileNameW(module, path, MAX_PATH) == 0)
+        return false;
+
+    DWORD handle = 0;
+    const DWORD size = GetFileVersionInfoSizeW(path, &handle);
+    if (size == 0)
+        return false;
+
+    vector<uint8_t> buffer(size);
+    if (!GetFileVersionInfoW(path, 0, size, buffer.data()))
+        return false;
+
+    VS_FIXEDFILEINFO* fixedInfo = nullptr;
+    UINT fixedInfoSize = 0;
+    if (!VerQueryValueW(
+            buffer.data(), L"\\",
+            reinterpret_cast<void**>(&fixedInfo), &fixedInfoSize) ||
+        !fixedInfo ||
+        fixedInfoSize < sizeof(VS_FIXEDFILEINFO) ||
+        fixedInfo->dwSignature != 0xFEEF04BD)
+        return false;
+
+    return HIWORD(fixedInfo->dwFileVersionMS) == 2 &&
+           LOWORD(fixedInfo->dwFileVersionMS) == 7 &&
+           HIWORD(fixedInfo->dwFileVersionLS) == 0 &&
+           LOWORD(fixedInfo->dwFileVersionLS) == 0 &&
+           HIWORD(fixedInfo->dwProductVersionMS) == 2 &&
+           LOWORD(fixedInfo->dwProductVersionMS) == 7 &&
+           HIWORD(fixedInfo->dwProductVersionLS) == 0 &&
+           LOWORD(fixedInfo->dwProductVersionLS) == 0;
 }
 
 bool InitDestinedDeathHooks()
 {
+    fpChrInsApplySpEffectInner = nullptr;
+
     const uintptr_t innerEntry = ResolveInnerApplyTarget();
     if (!innerEntry)
         return false;
@@ -376,14 +442,23 @@ bool InitDestinedDeathHooks()
         initializeStatus != MH_ERROR_ALREADY_INITIALIZED)
         return false;
 
-    if (MH_CreateHook(
-            reinterpret_cast<void*>(innerEntry),
-            reinterpret_cast<void*>(&hkChrInsApplySpEffectInner),
-            reinterpret_cast<void**>(&fpChrInsApplySpEffectInner)) != MH_OK)
+    const MH_STATUS createStatus = MH_CreateHook(
+        reinterpret_cast<void*>(innerEntry),
+        reinterpret_cast<void*>(&hkChrInsApplySpEffectInner),
+        reinterpret_cast<void**>(&fpChrInsApplySpEffectInner));
+    if (createStatus != MH_OK)
+    {
+        fpChrInsApplySpEffectInner = nullptr;
         return false;
+    }
 
     const MH_STATUS enableStatus =
         MH_EnableHook(reinterpret_cast<void*>(innerEntry));
-    return enableStatus == MH_OK ||
-           enableStatus == MH_ERROR_ENABLED;
+    if (enableStatus != MH_OK && enableStatus != MH_ERROR_ENABLED)
+    {
+        CleanupCreatedHook(innerEntry);
+        return false;
+    }
+
+    return true;
 }

@@ -15,6 +15,7 @@ namespace
 {
 constexpr int32_t SOURCE_SPEFFECT_ID = 29521;
 constexpr int32_t RUNTIME_SPEFFECT_ID = 90061;
+constexpr int32_t PERFECT_DEFLECT_MARKER_ID = 102001;
 constexpr int PARAM_WAIT_TIMEOUT_MS = 120000;
 
 constexpr size_t SPEFFECT_LIFECYCLE_FLAGS_OFFSET = 0x352;
@@ -117,10 +118,16 @@ static bool PatchSpEffectRow()
 
     auto [source, sourceExists] =
         from::param::SpEffectParam[SOURCE_SPEFFECT_ID];
-    destination = sourceExists
-        ? source
-        : from::paramdef::SP_EFFECT_PARAM_ST{};
+    if (!sourceExists)
+        return false;
 
+    auto [marker, markerExists] =
+        from::param::SpEffectParam[PERFECT_DEFLECT_MARKER_ID];
+    (void)marker;
+    if (!markerExists)
+        return false;
+
+    destination = source;
     ApplyRuntimeSpEffectOverrides(destination);
     ApplyRemainingSpEffectBits(destination);
     return true;
@@ -128,14 +135,15 @@ static bool PatchSpEffectRow()
 
 static bool PatchAtkParamNpc()
 {
-    uint32_t rows = 0;
+    uint32_t total = 0;
     for (auto [rowId, row] : from::param::AtkParam_Npc)
     {
-        ++rows;
-        if (!IsExcludedAtkParamNpcRow(rowId))
-            row.spEffectId3 = RUNTIME_SPEFFECT_ID;
+        ++total;
+        if (IsExcludedAtkParamNpcRow(rowId))
+            continue;
+        row.spEffectId3 = RUNTIME_SPEFFECT_ID;
     }
-    return rows != 0;
+    return total != 0;
 }
 
 static bool AtkParamNpcHasHpDamagePotential(
@@ -172,7 +180,7 @@ static bool PatchBulletAllowlist()
     if (kDestinedDeathBulletAllowlistCount != 6119)
         return false;
 
-    uint32_t existingRows = 0;
+    uint32_t patchedRows = 0;
     for (size_t i = 0; i < kDestinedDeathBulletAllowlistCount; ++i)
     {
         auto [row, exists] =
@@ -180,25 +188,26 @@ static bool PatchBulletAllowlist()
         if (!exists || !BulletRowHasDamagingAttack(row))
             continue;
         row.spEffectId3 = RUNTIME_SPEFFECT_ID;
-        ++existingRows;
+        ++patchedRows;
     }
-    return existingRows != 0;
+    return patchedRows != 0;
 }
 }
 
-void InitDestinedDeathParamPatch()
+bool InitDestinedDeathParamPatch()
 {
     if (!from::CS::SoloParamRepository::wait_for_params(PARAM_WAIT_TIMEOUT_MS))
-        return;
+        return false;
 
-    const auto repository =
-        from::CS::SoloParamRepository::instance();
+    const auto repository = from::CS::SoloParamRepository::instance();
     if (!repository)
-        return;
+        return false;
 
     if (!PatchSpEffectRow())
-        return;
+        return false;
 
-    PatchBulletAllowlist();
-    PatchAtkParamNpc();
+    if (!PatchBulletAllowlist())
+        return false;
+
+    return PatchAtkParamNpc();
 }

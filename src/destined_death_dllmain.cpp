@@ -5,8 +5,13 @@
 
 static DWORD WINAPI DestinedDeathWorker(LPVOID)
 {
+    if (!IsSupportedDestinedDeathExecutable())
+        return 0;
+
+    if (!InitDestinedDeathHooks())
+        return 0;
+
     InitDestinedDeathParamPatch();
-    InitDestinedDeathHooks();
     return 0;
 }
 

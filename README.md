@@ -89,8 +89,9 @@ Both targets are enabled by default:
 
 - `BUILD_SHARED_DAMAGE_MOD`
 - `BUILD_DESTINED_DEATH_MOD`
+- `USE_LOCAL_LIBER` — uses `libER/libER` when available; enabled by default.
 
-MinHook is fetched through CMake. For Destined Death, CMake uses `libER/libER` when present and otherwise fetches the pinned libER revision.
+MinHook is fetched through CMake. For Destined Death, CMake uses the local `libER/libER` checkout when `USE_LOCAL_LIBER=ON` and that checkout is available. Set `USE_LOCAL_LIBER=OFF` to use the pinned [`DeveshDFG/libER-1.17`](https://github.com/DeveshDFG/libER-1.17) fork instead.
 
 ### Build both DLLs
 
@@ -156,4 +157,4 @@ src/param_patch.cpp
 
 ## Pattern maintenance
 
-The hook signatures and expected RVAs in `src/hooks.cpp` and `src/destined_death_hooks.cpp` are specific to the tested Elden Ring version 1.16.2. After a game update, reacquire unique AoB matches, expected function-entry/pdata validation, and successful MinHook installation before reenabling the mod.
+The Shared Damage hook signatures and expected RVAs in `src/hooks.cpp` remain specific to Elden Ring 1.16.2 and have not yet been updated for 1.17. The Destined Death hook in `src/destined_death_hooks.cpp` is verified for Elden Ring 1.17, executable version `2.7.0.0`. After future game updates, re-get and validate all affected hook locations before enabling the corresponding mod.

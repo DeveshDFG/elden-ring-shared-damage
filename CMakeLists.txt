@@ -12,6 +12,7 @@ endif()
 
 option(BUILD_SHARED_DAMAGE_MOD "Build elden-ring-shared-damage.dll" ON)
 option(BUILD_DESTINED_DEATH_MOD "Build elden-ring-destined-death.dll" ON)
+option(USE_LOCAL_LIBER "Use the libER checkout under libER/libER" ON)
 
 include(FetchContent)
 
@@ -26,19 +27,38 @@ endif()
 
 if(BUILD_DESTINED_DEATH_MOD)
     set(LIBER_LOCAL_SOURCE_DIR "${CMAKE_SOURCE_DIR}/libER/libER")
-    if(EXISTS "${LIBER_LOCAL_SOURCE_DIR}/CMakeLists.txt")
+    if(USE_LOCAL_LIBER AND EXISTS "${LIBER_LOCAL_SOURCE_DIR}/CMakeLists.txt")
+        set(LIBER_SOURCE_DIR "${LIBER_LOCAL_SOURCE_DIR}")
         add_subdirectory(
             "${LIBER_LOCAL_SOURCE_DIR}"
             "${CMAKE_BINARY_DIR}/libER-local")
     else()
         FetchContent_Declare(
             libER
-            GIT_REPOSITORY https://github.com/Dasaav-dsv/libER.git
-            GIT_TAG d8ae5c92719adca4344d8d902b63286b807f562b
+            GIT_REPOSITORY https://github.com/DeveshDFG/libER-1.17.git
+            GIT_TAG 22340d9bc8e8ea966f9d1d3872e18908655c6c3d
             GIT_SUBMODULES_RECURSE TRUE
         )
         FetchContent_MakeAvailable(libER)
+        set(LIBER_SOURCE_DIR "${liber_SOURCE_DIR}")
     endif()
+
+    set(LIBER_SINGLETONS_CSV "${LIBER_SOURCE_DIR}/symbols/singletons.csv")
+    if(NOT EXISTS "${LIBER_SINGLETONS_CSV}")
+        message(FATAL_ERROR
+            "libER singleton symbols file is missing: ${LIBER_SINGLETONS_CSV}")
+    endif()
+    file(READ "${LIBER_SINGLETONS_CSV}" LIBER_SINGLETONS_CONTENT)
+    string(FIND
+        "${LIBER_SINGLETONS_CONTENT}"
+        "\"GLOBAL_SoloParamRepository\",\"64511832\""
+        LIBER_SOLO_PARAM_REPOSITORY_POSITION)
+    if(LIBER_SOLO_PARAM_REPOSITORY_POSITION EQUAL -1)
+        message(FATAL_ERROR
+            "libER does not contain the Elden Ring 1.17 "
+            "GLOBAL_SoloParamRepository symbol (64511832)")
+    endif()
+
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
 endif()
 
@@ -85,7 +105,7 @@ if(BUILD_DESTINED_DEATH_MOD)
     target_include_directories(elden-ring-destined-death PRIVATE include)
     target_link_libraries(
         elden-ring-destined-death
-        PRIVATE libER_static minhook psapi)
+        PRIVATE libER_static minhook psapi Version)
 
     set_target_properties(elden-ring-destined-death PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/natives"
